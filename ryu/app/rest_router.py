@@ -20,6 +20,7 @@ import socket
 import struct
 
 import json
+import pprint
 
 from ryu.app.wsgi import ControllerBase
 from ryu.app.wsgi import Response
@@ -447,7 +448,8 @@ class Router(dict):
         self.sw_id = {'sw_id': self.dpid_str}
         self.logger = logger
 
-        self.port_data = PortData(dp.ports)
+        print dp.ports
+	self.port_data = PortData(dp.ports)
 
         ofctl = OfCtl.factory(dp, logger)
         cookie = COOKIE_DEFAULT_ID
@@ -572,6 +574,7 @@ class Router(dict):
         header_list = dict((p.protocol_name, p)
                            for p in pkt.protocols
                            if isinstance(p, packet_base.PacketBase))
+	print header_list
         if header_list:
             # Check vlan-tag
             vlan_id = VLANID_NONE
@@ -744,6 +747,7 @@ class VlanRouter(object):
 
         # Set flow: L2 switching (normal)
         outport = self.ofctl.dp.ofproto.OFPP_NORMAL
+	print 'outport: %d' % outport
         priority = self._get_priority(PRIORITY_L2_SWITCHING)
         self.ofctl.set_routing_flow(
             cookie, priority, outport, dl_vlan=self.vlan_id,
@@ -1068,10 +1072,21 @@ class VlanRouter(object):
                              icmp.ICMP_PORT_UNREACH_CODE,
                              msg_data=msg.data)
 
+	datapath = msg.datapath
+	print datapath
+	pkt = packet.Packet(data=msg.data)
+	pkt_tcp = pkt.get_protocol(tcp.tcp)
+	l4data,l4type,payload = tcp.parser(pkt_tcp)
+
+	print payload	
+
         srcip = ip_addr_ntoa(header_list[IPV4].src)
         dstip = ip_addr_ntoa(header_list[IPV4].dst)
-        self.logger.info('Receive TCP/UDP from [%s] to router port [%s].',
-                         srcip, dstip, extra=self.sw_id)
+	srcport = pkt_tcp.src_port
+	dstport = pkt_tcp.dst_port
+
+        self.logger.info('Receive TCP/UDP from [%s:%s] to router port [%s:%s].',
+                         srcip, srcport, dstip, dstport, extra=self.sw_id)
         self.logger.info('Send ICMP destination unreachable to [%s].', srcip,
                          extra=self.sw_id)
 
@@ -1132,6 +1147,7 @@ class VlanRouter(object):
 
     def send_arp_request(self, src_ip, dst_ip, in_port=None):
         # Send ARP request from all ports.
+	pprint.pprint(self.port_data)
         for send_port in self.port_data.values():
             if in_port is None or in_port != send_port.port_no:
                 src_mac = send_port.mac
@@ -1356,7 +1372,8 @@ class RoutingTable(dict):
         if self.route_id == COOKIE_DEFAULT_ID:
             self.route_id = 1
 
-        return routing_data
+        pprint.pprint(routing_data)
+	return routing_data
 
     def delete(self, route_id):
         for key, value in self.items():
