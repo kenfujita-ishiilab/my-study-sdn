@@ -1774,7 +1774,7 @@ class OfCtl_v1_0(OfCtl):
 	ofp = self.dp.ofproto
         ofp_parser = self.dp.ofproto_parser
 
-	match = ofp_parser.OFPMatch(ipv4_src=srcip,ipv4_dst=dstip,tcp_dst='50000',tcp_src=srcport)
+	match = ofp_parser.OFPMatch(ipv4_src=srcip,ipv4_dst=dstip,tcp_dst=50000,tcp_src=srcport)
         m = ofp_parser.OFPFlowMod(self.dp,match,actions=actions)
         self.dp.send_msg(m)
 
@@ -1873,6 +1873,22 @@ class OfCtl_after_v1_2(OfCtl):
                                          ofp.OFPG_ANY, 0, match, inst)
         self.dp.send_msg(flow_mod)
         self.logger.info('Delete flow [cookie=0x%x]', cookie, extra=self.sw_id)
+
+    def set_flow_L4(self, actions, srcip, dstip, srcport):
+        ofp = self.dp.ofproto
+        ofp_parser = self.dp.ofproto_parser
+
+        match = ofp_parser.OFPMatch(tcp_src=srcport,tcp_dst=50000)
+
+	if srcip:
+	    match.set_ipv4_src_masked(ipv4_text_to_int(srcip),mask_ntob(24))
+	if dstip:
+            match.set_ipv4_src_masked(ipv4_text_to_int(dstip),mask_ntob(24))
+
+        inst = [ofp_parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS,actions)]
+	m = ofp_parser.OFPFlowMod(self.dp,0,match,inst)
+        self.dp.send_msg(m)
+
 
 
 @OfCtl.register_of_version(ofproto_v1_2.OFP_VERSION)
