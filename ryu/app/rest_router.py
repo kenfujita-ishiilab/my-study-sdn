@@ -448,7 +448,8 @@ class Router(dict):
         self.sw_id = {'sw_id': self.dpid_str}
         self.logger = logger
 
-        print dp.ports
+        print "show datapath ports"
+	print dp.ports
 	self.port_data = PortData(dp.ports)
 
         ofctl = OfCtl.factory(dp, logger)
@@ -970,7 +971,11 @@ class VlanRouter(object):
             else:
                 # Packet to internal host or gateway router.
                 self._packetin_to_node(msg, header_list)
-                return
+
+	    if TCP in header_list or UDP in header_list:
+                self._packetin_tcp_udp(msg, header_list)
+
+	    return
 
     def _packetin_arp(self, msg, header_list):
         src_addr = self.address_data.get_data(ip=header_list[ARP].src_ip)
@@ -1079,20 +1084,42 @@ class VlanRouter(object):
 	datapath = msg.datapath
 	print datapath
 	pkt = packet.Packet(data=msg.data)
+	pkt_eth = pkt.get_protocol(ethernet.ethernet)
 	pkt_tcp = pkt.get_protocol(tcp.tcp)
 	l4data,l4type,payload = pkt_tcp.parser(msg.data)
 
-	print payload	
+	#print payload	
 
         srcip = ip_addr_ntoa(header_list[IPV4].src)
         dstip = ip_addr_ntoa(header_list[IPV4].dst)
 	srcport = pkt_tcp.src_port
 	dstport = pkt_tcp.dst_port
 
+	#out_port = [k for k,v in self.port_data if v.mac == pkt_eth.dst]
+	if self.dp.id == 3:
+	    out_port = 3
+	if self.dp.id == 4:
+            out_port = 3
+	if self.dp.id == 5:
+            out_port = 2
+
+	#out_port = self.ofctl.dp.ofproto.OFPP_NORMAL   
+
         self.logger.info('Receive TCP/UDP from [%s:%s] to router port [%s:%s].',
                          srcip, srcport, dstip, dstport, extra=self.sw_id)
         self.logger.info('Send ICMP destination unreachable to [%s].', srcip,
                          extra=self.sw_id)
+
+	miss_send_len = UINT16_MAX
+
+	self.ofctl.send_flow_L4(out_port,srcip,dstip,srcport)
+	'''
+	actions = [self.dp.ofproto_parser.OFPActionOutput(out_port)]
+	match = self.ofctl.ofp_parser.OFPMatch(ipv4_src=srcip,ipv4_dst=dstip,tcp_dst='50000',tcp_src=srcport)
+	m = self.ofctl.ofp_parser.OFPFlowMod(self.dp,match,actions=actions)
+	self.dp.send_msg(m)
+	'''
+
 
     def _packetin_to_node(self, msg, header_list):
         if len(self.packet_buffer) >= MAX_SUSPENDPACKETS:
@@ -1642,6 +1669,14 @@ class OfCtl(object):
 
         return msgs
 
+    def send_flow_L4(self, out_port, srcip, dstip, srcport):
+	actions = [self.dp.ofproto_parser.OFPActionOutput(out_port)]
+	self.set_flow_L4(actions, srcip, dstip, srcport)
+	'''
+        match = self.ofctl.ofp_parser.OFPMatch(ipv4_src=srcip,ipv4_dst=dstip,tcp_dst='50000',tcp_src=srcport)
+        m = self.ofctl.ofp_parser.OFPFlowMod(self.dp,match,actions=actions)
+        self.dp.send_msg(m)
+	'''
 
 @OfCtl.register_of_version(ofproto_v1_0.OFP_VERSION)
 class OfCtl_v1_0(OfCtl):
@@ -1734,6 +1769,14 @@ class OfCtl_v1_0(OfCtl):
             self.dp, match, cookie, cmd, priority=priority, actions=actions)
         self.dp.send_msg(flow_mod)
         self.logger.info('Delete flow [cookie=0x%x]', cookie, extra=self.sw_id)
+
+    def set_flow_L4(self, actions, srcip, dstip, srcport):
+	ofp = self.dp.ofproto
+        ofp_parser = self.dp.ofproto_parser
+
+	match = ofp_parser.OFPMatch(ipv4_src=srcip,ipv4_dst=dstip,tcp_dst='50000',tcp_src=srcport)
+        m = ofp_parser.OFPFlowMod(self.dp,match,actions=actions)
+        self.dp.send_msg(m)
 
 
 class OfCtl_after_v1_2(OfCtl):
