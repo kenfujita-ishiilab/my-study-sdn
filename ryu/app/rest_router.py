@@ -955,6 +955,8 @@ class VlanRouter(object):
             return
 
         if IPV4 in header_list:
+	    if TCP in header_list or UDP in header_list:
+            	self._packetin_tcp_udp(msg, header_list)
             rt_ports = self.address_data.get_default_gw()
             if header_list[IPV4].dst in rt_ports:
                 # Packet to router's port.
@@ -963,7 +965,7 @@ class VlanRouter(object):
                         self._packetin_icmp_req(msg, header_list)
                         return
                 elif TCP in header_list or UDP in header_list:
-                    self._packetin_tcp_udp(msg, header_list)
+                    #self._packetin_tcp_udp(msg, header_list)
                     return
             else:
                 # Packet to internal host or gateway router.
@@ -1052,12 +1054,12 @@ class VlanRouter(object):
     def _packetin_icmp_req(self, msg, header_list):
         # Send ICMP echo reply.
         in_port = self.ofctl.get_packetin_inport(msg)
-        self.ofctl.send_icmp(in_port, header_list, self.vlan_id,
+	self.ofctl.send_icmp(in_port, header_list, self.vlan_id,
                              icmp.ICMP_ECHO_REPLY,
                              icmp.ICMP_ECHO_REPLY_CODE,
                              icmp_data=header_list[ICMP].data)
 
-        srcip = ip_addr_ntoa(header_list[IPV4].src)
+	srcip = ip_addr_ntoa(header_list[IPV4].src)
         dstip = ip_addr_ntoa(header_list[IPV4].dst)
         log_msg = 'Receive ICMP echo request from [%s] to router port [%s].'
         self.logger.info(log_msg, srcip, dstip, extra=self.sw_id)
@@ -1067,16 +1069,18 @@ class VlanRouter(object):
     def _packetin_tcp_udp(self, msg, header_list):
         # Send ICMP port unreach error.
         in_port = self.ofctl.get_packetin_inport(msg)
+	'''
         self.ofctl.send_icmp(in_port, header_list, self.vlan_id,
                              icmp.ICMP_DEST_UNREACH,
                              icmp.ICMP_PORT_UNREACH_CODE,
                              msg_data=msg.data)
 
+	'''
 	datapath = msg.datapath
 	print datapath
 	pkt = packet.Packet(data=msg.data)
 	pkt_tcp = pkt.get_protocol(tcp.tcp)
-	l4data,l4type,payload = tcp.parser(pkt_tcp)
+	l4data,l4type,payload = pkt_tcp.parser(msg.data)
 
 	print payload	
 
