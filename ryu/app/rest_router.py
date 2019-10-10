@@ -1878,7 +1878,7 @@ class OfCtl_after_v1_2(OfCtl):
         ofp = self.dp.ofproto
         ofp_parser = self.dp.ofproto_parser
 
-        match = ofp_parser.OFPMatch(tcp_src=srcport,tcp_dst=50000)
+        match = ofp_parser.OFPMatch(ip_proto=6,tcp_src=srcport,tcp_dst=50000)
 
 	if srcip:
 	    match.set_ipv4_src_masked(ipv4_text_to_int(srcip),mask_ntob(24))
