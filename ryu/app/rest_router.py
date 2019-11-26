@@ -814,7 +814,7 @@ class VlanRouter(object):
         cookie = self._id_to_cookie(REST_ROUTEID, route.route_id)
         priority, log_msg = self._get_priority(PRIORITY_TYPE_ROUTE,
                                                route=route)
-	if tp_dst is None and tp_src is None:
+	if route.dst_port is None and route.src_port is None:
 	    l4_type=0
 	else:
 	    l4_type=6
@@ -1110,18 +1110,21 @@ class VlanRouter(object):
 	pkt = packet.Packet(data=msg.data)
 	pkt_eth = pkt.get_protocol(ethernet.ethernet)
 	pkt_tcp = pkt.get_protocol(tcp.tcp)
-	'''
+
 	if pkt_tcp:
 	    pkt_pay = pkt.protocols[-1]
 	    if pkt_pay != pkt_tcp:
-		print pkt_pay
-	    else:
-        	print 'pkt_pay is none'
+		# print pkt_pay.encode('hex')
+		f = open('tcp_img_packet.txt','a')
+                print >> f, pkt_pay.encode('hex')
+                f.close()
+	    # else:
+        	# print 'pkt_pay is none'
+	
+	# pkt_pay = pkt.protocols[-1]
+	# print pkt_pay
+	# l4data,l4type,payload = pkt_tcp.parser(msg.data)
 	'''
-	pkt_pay = pkt.protocols[-1]
-	print pkt_pay
-	l4data,l4type,payload = pkt_tcp.parser(msg.data)
-
 	if payload:
 	    # print type(payload) ... type(str)
 	    # bin_pay = binascii.a2b_hex(payload.encode('ascii'))
@@ -1129,7 +1132,7 @@ class VlanRouter(object):
 	    print >> f, payload.encode('hex')
 	    f.close()
 	    print payload.encode('hex')
-
+	'''
         srcip = ip_addr_ntoa(header_list[IPV4].src)
         dstip = ip_addr_ntoa(header_list[IPV4].dst)
 	srcport = pkt_tcp.src_port
@@ -1158,8 +1161,8 @@ class VlanRouter(object):
 	if not address:
 	    address = self.address_data.add(header_list[IPV4].dst)
 	'''
-	route_data = self.routing_tbl.get_data(dst_ip=dstip)
-	self._set_route_packetin(route_data)
+	#route_data = self.routing_tbl.get_data(dst_ip=dstip)
+	#self._set_route_packetin(route_data)
 	# cookie = self._id_to_cookie(REST_ROUTEID, route_data.route_id)
 	# priority = 0
 
@@ -1862,6 +1865,7 @@ class OfCtl_after_v1_2(OfCtl):
 	ofp = self.dp.ofproto
         ofp_parser = self.dp.ofproto_parser
         cmd = ofp.OFPFC_ADD
+	miss_send_len = UINT16_MAX
 
         # Match
         match = ofp_parser.OFPMatch()
@@ -1889,6 +1893,9 @@ class OfCtl_after_v1_2(OfCtl):
 
         # Instructions
         actions = actions or []
+	if tcp_dst or tcp_src:
+	    actions.append(ofp_parser.OFPActionOutput(
+				self.dp.ofproto.OFPP_NORMAL, miss_send_len))
         inst = [ofp_parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS,
                                                  actions)]
 
