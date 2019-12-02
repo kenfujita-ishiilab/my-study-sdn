@@ -1120,11 +1120,14 @@ class VlanRouter(object):
 
 	'''
 	datapath = msg.datapath
-	parser = datapath.ofproto_parser
+	parser = self.dp.ofproto_parser
 	print 'dpid is {}'.format(datapath.id)
 	pkt = packet.Packet(data=msg.data)
 	pkt_eth = pkt.get_protocol(ethernet.ethernet)
 	pkt_tcp = pkt.get_protocol(tcp.tcp)
+	pkt_pay = pkt.protocols[-1]
+
+	l4_type=6
 
 	srcip = ip_addr_ntoa(header_list[IPV4].src)
         dstip = ip_addr_ntoa(header_list[IPV4].dst)
@@ -1140,31 +1143,43 @@ class VlanRouter(object):
         else:
             out_port = self.ofctl.dp.ofproto.OFPP_NORMAL
 
-	key = '%s/%d-%s/%s-%s' % (ip_str, netmask, str(src_port_no), str(dst_port_no), str(label))
-	route_data = self.routing_tbl.get_data(dst_flow=dstip)
-	self.logger.info(pprint.pformat(route_data), extra=self.sw_id)
-        cookie = self._id_to_cookie(REST_ROUTEID, route_data.route_id)
-        priority, log_msg = self._get_priority(PRIORITY_TYPE_ROUTE,
+	miss_send_len = UINT16_MAX
+
+	address = self.address_data.get_data(ip=header_list[IPV4].dst)
+	if address:
+	    route_data = self.routing_tbl.get_data(dst_ip=dstip)
+	    self.logger.info(pprint.pformat(route_data), extra=self.sw_id)
+            cookie = self._id_to_cookie(REST_ROUTEID, route_data.route_id)
+            priority, log_msg = self._get_priority(PRIORITY_TYPE_ROUTE,
                                                route=route_data)
 
         key = '%s/%d-%s/%d' % (srcip,srcport,dstip,dstport)
 	self.l4data_tbl.setdefault(key,{})
 
-	l4_type=6
-
-	pkt_pay = pkt.protocols[-1]
 	if pkt_pay != pkt_tcp:
-	    #print type(pkt_pay.encode('hex'))
 	    self.l4data_tbl[key].setdefault('count',0)
-	    self.l4data_tbl[key]['count'] += 1
+            self.l4data_tbl[key]['count'] += 1
+	    self.l4data_tbl[key].setdefault('flag',False)
+	    self.l4data_tbl[key].setdefault('label',0)	
 	    if (self.l4data_tbl[key]['count'] == 1 and 
-	pkt_pay.encode('hex')[:16] == '89504e470d0a1a0a'):
+	            pkt_pay.encode('hex')[:16] == '89504e470d0a1a0a'):
+		self.l4data_tbl[key]['flag'] = True
+		self.logger.info('this packet is the first image data!', extra=self.sw_id)
+		'''
+		if address:
+                    route_data = self.routing_tbl.get_data(dst_ip=dstip,metadata=META_IMAGE)
+                    cookie = self._id_to_cookie(REST_ROUTEID, route_data.route_id)
+                    priority, log_msg = self._get_priority(PRIORITY_TYPE_ROUTE,
+                                               route=route_data)
+		'''
 		check_type = 'this is png'
 		self.logger.info('this data is image!!(first time)',extra=self.sw_id)
 		# mplsなどでタグを付与
 		label = META_IMAGE
+		self.l4data_tbl[key]['label'] = META_IMAGE
 		# imageをやり取りしているflow(srcip,srcport,dstip,dstport)
 		# に対してタグを付与するフローエントリを作成
+		
 		self.ofctl.set_packetin_flow(cookie, priority,out_port,
                                      dl_type=ether.ETH_TYPE_IP,
                                      dl_vlan=self.vlan_id,
@@ -1175,9 +1190,25 @@ class VlanRouter(object):
                                      tcp_src=route.src_port,
 				     mpls_label=label,
 				     labelflag=True)
-
+		
+		# actions = [parser.OFPActionSetField(metadata=label),
+		# 		parser.OFPActionOutput(self.dp.ofproto.OFPP_IN_PORT, 0)]
+		# m = parser.OFPPacketOut(datapath=datapath,buffer_id=self.dp.ofproto.OFP_NO_BUFFER,in_port=in_port,actions=actions,data=msg.data)
+		# self.dp.send_msg(m)
+		# self.dp.send_packet_out(buffer_id=UINT32_MAX, in_port=in_port, actions=actions, data=msg.data)
+		self.logger.info('done packet send', extra=self.sw_id)
+	    elif self.l4data_tbl[key]['flag'] == True:
+		# パケットにmetadataを付与
+		check_type = 'Image!'
+		self.logger.info('this packet is image', extra=self.sw_id)
+		# actions = [parser.OFPActionSetField(metadata=self.l4data_tbl[key]['label']),
+		# 		parser.OFPActionOutput(self.dp.ofproto.OFPP_IN_PORT, 0)]
+                # m = parser.OFPPacketOut(datapath=datapath,buffer_id=self.dp.ofproto.OFP_NO_BUFFER,in_port=in_port,actions=actions,data=msg.data)
+                # self.dp.send_msg(m)
+		# self.dp.send_packet_out(buffer_id=UINT32_MAX, in_port=in_port, actions=actions, data=msg.data)
 	    elif '0000000049454e44' in pkt_pay.encode('hex'):
 		check_type = 'this is finish png'
+		self.l4data_tbl[key]['flag'] = False
 		# フローを削除する
 	    else:
 		check_type = 'not'
@@ -1202,7 +1233,6 @@ class VlanRouter(object):
                          srcip, srcport, dstip, dstport, extra=self.sw_id)
         # self.logger.info('Send ICMP destination unreachable to [%s].', srcip, extra=self.sw_id)
 
-	miss_send_len = UINT16_MAX
 	#self.ofctl.send_flow_L4(cookie,priority,in_port,out_port,srcip,dstip)
 	
 	# actions = [parser.OFPActionOutput(self.dp.ofproto.OFPP_IN_PORT)]
@@ -1456,7 +1486,6 @@ class Address(object):
     def __contains__(self, ip):
         return bool(ipv4_apply_mask(ip, self.netmask) == self.nw_addr)
 
-
 class RoutingTable(dict):
     def __init__(self):
         super(RoutingTable, self).__init__()
@@ -1489,7 +1518,8 @@ class RoutingTable(dict):
             raise CommandFailure(msg=msg)
 
         routing_data = Route(self.route_id, dst_ip, netmask, gateway_ip, dst_port_no, src_port_no, label)
-        ip_str = ip_addr_ntoa(dst_ip)
+	ip_str = ip_addr_ntoa(dst_ip)
+	print "dsp_ip = {}, ip_str = {}".format(str(dst_ip),str(ip_str))
 	# ex. 192.168.1.0/24-0/0-0
         key = '%s/%d-%s/%s-%s' % (ip_str, netmask, str(src_port_no), str(dst_port_no), str(label))
         self[key] = routing_data
@@ -1512,7 +1542,7 @@ class RoutingTable(dict):
     def get_gateways(self):
         return [routing_data.gateway_ip for routing_data in self.values()]
 
-    def get_data(self, gw_mac=None, dst_ip=None, metadata=None):
+    def get_data(self, gw_mac=None, dst_ip=None, metadata=0):
         if gw_mac is not None:
             for route in self.values():
                 if gw_mac == route.gateway_mac:
@@ -1526,6 +1556,7 @@ class RoutingTable(dict):
                 if ipv4_apply_mask(dst_ip, route.netmask) == route.dst_ip:
                     # For longest match
                     if mask < route.netmask:
+			# if route.metadata == metadata:
                         get_route = route
                         mask = route.netmask
 
@@ -1953,7 +1984,7 @@ class OfCtl_after_v1_2(OfCtl):
                                                  actions)]
 
 	if flag and metadata > 0:
-	    inst.append(ofp_parser.OFPInstructionWriteMetadata(int(metadata),META_MASK))
+	    inst.append(ofp_parser.OFPInstructionWriteMetadata(int(metadata),UINT16_MAX))
 
         m = ofp_parser.OFPFlowMod(self.dp, cookie, 0, 0, cmd, idle_timeout,
                                   0, priority, UINT32_MAX, ofp.OFPP_ANY,
@@ -1999,25 +2030,59 @@ class OfCtl_after_v1_2(OfCtl):
                                          ofp.OFPG_ANY, 0, match, inst)
         self.dp.send_msg(flow_mod)
         self.logger.info('Delete flow [cookie=0x%x]', cookie, extra=self.sw_id)
-
-    def set_flow_L4(self, cookie, priority, actions, in_port, srcip, dstip):
+	
+    # マッチするIP+ポートのフローに対してlabelをセットするだけのフロー登録
+    def set_flow_L4(self, cookie, priority, actions, in_port, srcip, dstip, sport, dport, label):
+	self.logger.info('Set Flow by OfCtl after ver 1.2',extra=self.sw_id)
         ofp = self.dp.ofproto
         ofp_parser = self.dp.ofproto_parser
-	cmd = ofp.OFPFC_ADD
+        cmd = ofp.OFPFC_ADD
+        miss_send_len = UINT16_MAX
 
-        match = ofp_parser.OFPMatch(in_port=in_port,eth_type=0x0800,ip_proto=6,ipv4_dst=dstip,ipv4_src=srcip,tcp_dst=50000)
+        # Match
+        match = ofp_parser.OFPMatch()
+        if dl_type:
+            match.set_dl_type(dl_type)
+        if dl_dst:
+            match.set_dl_dst(dl_dst)
+        if dl_vlan:
+            match.set_vlan_vid(dl_vlan)
+        if nw_src:
+            match.set_ipv4_src_masked(ipv4_text_to_int(nw_src),
+                                      mask_ntob(src_mask))
+        if nw_dst:
+            match.set_ipv4_dst_masked(ipv4_text_to_int(nw_dst),
+                                      mask_ntob(dst_mask))
+        if ip_proto:
+            if dl_type == ether.ETH_TYPE_IP:
+                match.set_ip_proto(ip_proto)
+            elif dl_type == ether.ETH_TYPE_ARP:
+                match.set_arp_opcode(nw_proto)
+        if tcp_dst:
+            match.set_tcp_dst(int(tcp_dst))
+        if tcp_src:
+            match.set_tcp_src(int(tcp_src))
+        if metadata:
+	    match.set_metadata(int(metadata))
 
-	'''
-	if srcip:
-	    match.set_ipv4_src_masked(ipv4_text_to_int(srcip),mask_ntob(24))
-	if dstip:
-            match.set_ipv4_src_masked(ipv4_text_to_int(dstip),mask_ntob(24))
-	'''
-        inst = [ofp_parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS,actions)]
-	m = ofp_parser.OFPFlowMod(self.dp,cookie,0,0,cmd,0,0,priority,UINT32_MAX,ofp.OFPP_ANY,ofp.OFPG_ANY,0,match,inst)
-        self.dp.send_msg(m)
+        # Instructions
+        actions = actions or []
+        if tcp_dst or tcp_src:
+            actions.append(ofp_parser.OFPActionOutput(
+                                self.dp.ofproto.OFPP_NORMAL, miss_send_len))
+        # if flag and metadata > 0:
+        #     actions.append(ofp_parser.OFPActionSetField(
+        #                       metadata=int(metadata)))
+        inst = [ofp_parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS,
+                                                 actions)]
 
+        if flag and metadata > 0:
+            inst.append(ofp_parser.OFPInstructionWriteMetadata(int(metadata),UINT16_MAX))
 
+        m = ofp_parser.OFPFlowMod(self.dp, cookie, 0, 0, cmd, idle_timeout,
+                                  0, priority, UINT32_MAX, ofp.OFPP_ANY,
+                                  ofp.OFPG_ANY, 0, match, inst)
+        self.dp.send_msg(m)    
 
 @OfCtl.register_of_version(ofproto_v1_2.OFP_VERSION)
 class OfCtl_v1_2(OfCtl_after_v1_2):
