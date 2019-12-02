@@ -153,6 +153,7 @@ REST_DESTINATION = 'destination'
 REST_GATEWAY = 'gateway'
 REST_DSTPORT = 'dport'
 REST_SRCPORT = 'sport'
+REST_LABEL = 'label'
 
 PRIORITY_VLAN_SHIFT = 1000
 PRIORITY_NETMASK_SHIFT = 32
@@ -169,6 +170,10 @@ PRIORITY_L4_HANDLING = 6
 
 PRIORITY_TYPE_ROUTE = 'priority_route'
 
+META_TEXT = 1
+META_IMAGE = 10
+META_VIDEO = 100
+META_MASK = 0xffff
 
 def get_priority(priority_type, vid=0, route=None):
     log_msg = None
@@ -347,9 +352,12 @@ class RouterController(ControllerBase):
         cls._LOGGER = logger
         cls._LOGGER.propagate = False
         hdlr = logging.StreamHandler()
+	fdlr = logging.FileHandler(filename="rest_router.log")
         fmt_str = '[RT][%(levelname)s] switch_id=%(sw_id)s: %(message)s'
         hdlr.setFormatter(logging.Formatter(fmt_str))
+	fdlr.setFormatter(logging.Formatter(fmt_str))
         cls._LOGGER.addHandler(hdlr)
+	cls._LOGGER.addHandler(fdlr)
 
     @classmethod
     def register_router(cls, dp):
@@ -475,10 +483,10 @@ class Router(dict):
                          cookie, extra=self.sw_id)
 
         # Set L4
-	priority = 0
-	ofctl.set_packetin_flow(cookie, priority, dl_type=ether.ETH_TYPE_IP, ip_proto=6)
-        self.logger.info('Set L4 switching (normal) flow [cookie=0x%x]',
-                        cookie, extra=self.sw_id)
+	# priority = 0
+	# ofctl.set_packetin_flow(cookie, priority, dl_type=ether.ETH_TYPE_IP, ip_proto=6)
+        # self.logger.info('Set L4 switching (normal) flow [cookie=0x%x]',
+        #                 cookie, extra=self.sw_id)
 
 	# Set VlanRouter for vid=None.
         vlan_router = VlanRouter(VLANID_NONE, dp, self.port_data, logger)
@@ -620,6 +628,7 @@ class VlanRouter(object):
         self.port_data = port_data
         self.address_data = AddressData()
         self.routing_tbl = RoutingTable()
+	self.l4data_tbl = {}
         self.packet_buffer = SuspendPacketList(self.send_icmp_unreach_error)
         self.ofctl = OfCtl.factory(dp, logger)
 
@@ -723,14 +732,19 @@ class VlanRouter(object):
 		if REST_DSTPORT in data:
 		    dport = data[REST_DSTPORT]
 		else:
-		    dport = None
+		    dport = 0
 
 		if REST_SRCPORT in data:
                     sport = data[REST_SRCPORT]
                 else:
-                    sport = None
+                    sport = 0
 
-                route_id = self._set_routing_data(destination, gateway, dport, sport)
+		if REST_LABEL in data:
+		    label = data[REST_LABEL]
+		else:
+		    label = 0
+
+                route_id = self._set_routing_data(destination, gateway, dport, sport, label)
                 details = 'Add route [route_id=%d]' % route_id
 
         except CommandFailure as err_msg:
@@ -783,7 +797,7 @@ class VlanRouter(object):
 
         return address.address_id
 
-    def _set_routing_data(self, destination, gateway, dport, sport):
+    def _set_routing_data(self, destination, gateway, dport, sport, label):
         err_msg = 'Invalid [%s] value.' % REST_GATEWAY
         dst_ip = ip_addr_aton(gateway, err_msg=err_msg)
         address = self.address_data.get_data(ip=dst_ip)
@@ -796,7 +810,7 @@ class VlanRouter(object):
             raise CommandFailure(msg=msg)
         else:
             src_ip = address.default_gw
-            route = self.routing_tbl.add(destination, gateway, dport, sport)
+            route = self.routing_tbl.add(destination, gateway, dport, sport, label)
             self._set_route_packetin(route)
             self.send_arp_request(src_ip, dst_ip)
             return route.route_id
@@ -825,7 +839,8 @@ class VlanRouter(object):
                                      dst_mask=route.netmask,
 				     ip_proto=l4_type,
 				     tcp_dst=route.dst_port,
-				     tcp_src=route.src_port)
+				     tcp_src=route.src_port,
+				     metadata=route.metadata)
         self.logger.info('Set %s (packet in) flow [cookie=0x%x]', log_msg,
                          cookie, extra=self.sw_id)
 
@@ -1111,61 +1126,83 @@ class VlanRouter(object):
 	pkt_eth = pkt.get_protocol(ethernet.ethernet)
 	pkt_tcp = pkt.get_protocol(tcp.tcp)
 
-	if pkt_tcp:
-	    pkt_pay = pkt.protocols[-1]
-	    if pkt_pay != pkt_tcp:
-		# print pkt_pay.encode('hex')
-		f = open('tcp_img_packet.txt','a')
-                print >> f, pkt_pay.encode('hex')
-                f.close()
-	    # else:
-        	# print 'pkt_pay is none'
+	srcip = ip_addr_ntoa(header_list[IPV4].src)
+        dstip = ip_addr_ntoa(header_list[IPV4].dst)
+        srcport = pkt_tcp.src_port
+        dstport = pkt_tcp.dst_port
+
+	if datapath.id == 3 and in_port == 1:
+            out_port = 3
+        elif datapath.id == 4 and in_port == 2:
+            out_port = 3
+        elif datapath.id == 5 and in_port == 1:
+            out_port = 2
+        else:
+            out_port = self.ofctl.dp.ofproto.OFPP_NORMAL
+
+	key = '%s/%d-%s/%s-%s' % (ip_str, netmask, str(src_port_no), str(dst_port_no), str(label))
+	route_data = self.routing_tbl.get_data(dst_flow=dstip)
+	self.logger.info(pprint.pformat(route_data), extra=self.sw_id)
+        cookie = self._id_to_cookie(REST_ROUTEID, route_data.route_id)
+        priority, log_msg = self._get_priority(PRIORITY_TYPE_ROUTE,
+                                               route=route_data)
+
+        key = '%s/%d-%s/%d' % (srcip,srcport,dstip,dstport)
+	self.l4data_tbl.setdefault(key,{})
+
+	l4_type=6
+
+	pkt_pay = pkt.protocols[-1]
+	if pkt_pay != pkt_tcp:
+	    #print type(pkt_pay.encode('hex'))
+	    self.l4data_tbl[key].setdefault('count',0)
+	    self.l4data_tbl[key]['count'] += 1
+	    if (self.l4data_tbl[key]['count'] == 1 and 
+	pkt_pay.encode('hex')[:16] == '89504e470d0a1a0a'):
+		check_type = 'this is png'
+		self.logger.info('this data is image!!(first time)',extra=self.sw_id)
+		# mplsなどでタグを付与
+		label = META_IMAGE
+		# imageをやり取りしているflow(srcip,srcport,dstip,dstport)
+		# に対してタグを付与するフローエントリを作成
+		self.ofctl.set_packetin_flow(cookie, priority,out_port,
+                                     dl_type=ether.ETH_TYPE_IP,
+                                     dl_vlan=self.vlan_id,
+                                     dst_ip=route.dst_ip,
+                                     dst_mask=route.netmask,
+                                     ip_proto=l4_type,
+                                     tcp_dst=route.dst_port,
+                                     tcp_src=route.src_port,
+				     mpls_label=label,
+				     labelflag=True)
+
+	    elif '0000000049454e44' in pkt_pay.encode('hex'):
+		check_type = 'this is finish png'
+		# フローを削除する
+	    else:
+		check_type = 'not'
+	    f = open('check_img_pkt.txt','a')
+            print >> f, check_type
+            f.close()
+	    if self.l4data_tbl[key]['count'] == 1:
+	        self.l4data_tbl[key].setdefault('datatype',pkt_pay.encode('hex')[:16])
+	    # f = open('tcp_img_packet.txt','a')
+            # print >> f, pkt_pay.encode('hex')
+            # f.close()
+	# else:
+            # print 'pkt_pay is none'
+	pprint.pprint(self.l4data_tbl)
+	self.logger.info(pprint.pformat(self.l4data_tbl), extra=self.sw_id)
 	
 	# pkt_pay = pkt.protocols[-1]
 	# print pkt_pay
 	# l4data,l4type,payload = pkt_tcp.parser(msg.data)
-	'''
-	if payload:
-	    # print type(payload) ... type(str)
-	    # bin_pay = binascii.a2b_hex(payload.encode('ascii'))
-	    f = open('tcp_packet.txt','w')
-	    print >> f, payload.encode('hex')
-	    f.close()
-	    print payload.encode('hex')
-	'''
-        srcip = ip_addr_ntoa(header_list[IPV4].src)
-        dstip = ip_addr_ntoa(header_list[IPV4].dst)
-	srcport = pkt_tcp.src_port
-	dstport = pkt_tcp.dst_port
-
 	#out_port = [k for k,v in self.port_data if v.mac == pkt_eth.dst]
-	if self.dp.id == 3 and in_port == 1:
-	    out_port = 3
-	elif self.dp.id == 4 and in_port == 2:
-            out_port = 3
-	elif self.dp.id == 5 and in_port == 1:
-            out_port = 2
-	else:
-	    out_port = self.ofctl.dp.ofproto.OFPP_NORMAL
-
-	#out_port = self.ofctl.dp.ofproto.OFPP_NORMAL   
-
         self.logger.info('Receive TCP/UDP from [%s:%s] to router port [%s:%s].',
                          srcip, srcport, dstip, dstport, extra=self.sw_id)
         # self.logger.info('Send ICMP destination unreachable to [%s].', srcip, extra=self.sw_id)
 
 	miss_send_len = UINT16_MAX
-
-	'''
-	address = self.address_data.get_data(ip=header_list[IPV4].dst)
-	if not address:
-	    address = self.address_data.add(header_list[IPV4].dst)
-	'''
-	#route_data = self.routing_tbl.get_data(dst_ip=dstip)
-	#self._set_route_packetin(route_data)
-	# cookie = self._id_to_cookie(REST_ROUTEID, route_data.route_id)
-	# priority = 0
-
 	#self.ofctl.send_flow_L4(cookie,priority,in_port,out_port,srcip,dstip)
 	
 	# actions = [parser.OFPActionOutput(self.dp.ofproto.OFPP_IN_PORT)]
@@ -1425,7 +1462,7 @@ class RoutingTable(dict):
         super(RoutingTable, self).__init__()
         self.route_id = 1
 
-    def add(self, dst_nw_addr, gateway_ip, dst_port_no, src_port_no):
+    def add(self, dst_nw_addr, gateway_ip, dst_port_no, src_port_no, label):
         err_msg = 'Invalid [%s] value.'
 
         if dst_nw_addr == DEFAULT_ROUTE:
@@ -1443,15 +1480,18 @@ class RoutingTable(dict):
             if DEFAULT_ROUTE in self:
                 overlap_route = self[DEFAULT_ROUTE].route_id
         elif dst_nw_addr in self:
-            overlap_route = self[dst_nw_addr].route_id
+	    if dst_port_no in self and src_port_no in self:
+		if label in self:
+            	    overlap_route = self[dst_nw_addr].route_id
 
         if overlap_route is not None:
             msg = 'Destination overlaps [route_id=%d]' % overlap_route
             raise CommandFailure(msg=msg)
 
-        routing_data = Route(self.route_id, dst_ip, netmask, gateway_ip, dst_port_no, src_port_no)
+        routing_data = Route(self.route_id, dst_ip, netmask, gateway_ip, dst_port_no, src_port_no, label)
         ip_str = ip_addr_ntoa(dst_ip)
-        key = '%s/%d' % (ip_str, netmask)
+	# ex. 192.168.1.0/24-0/0-0
+        key = '%s/%d-%s/%s-%s' % (ip_str, netmask, str(src_port_no), str(dst_port_no), str(label))
         self[key] = routing_data
 
         self.route_id += 1
@@ -1459,7 +1499,7 @@ class RoutingTable(dict):
         if self.route_id == COOKIE_DEFAULT_ID:
             self.route_id = 1
 
-        pprint.pprint(routing_data)
+        # pprint.pprint(routing_data)
 	print "route id is %d" % (self.route_id)
 	return routing_data
 
@@ -1472,7 +1512,7 @@ class RoutingTable(dict):
     def get_gateways(self):
         return [routing_data.gateway_ip for routing_data in self.values()]
 
-    def get_data(self, gw_mac=None, dst_ip=None):
+    def get_data(self, gw_mac=None, dst_ip=None, metadata=None):
         if gw_mac is not None:
             for route in self.values():
                 if gw_mac == route.gateway_mac:
@@ -1497,7 +1537,7 @@ class RoutingTable(dict):
 
 
 class Route(object):
-    def __init__(self, route_id, dst_ip, netmask, gateway_ip, dst_port, src_port):
+    def __init__(self, route_id, dst_ip, netmask, gateway_ip, dst_port, src_port, metadata):
         super(Route, self).__init__()
         self.route_id = route_id
         self.dst_ip = dst_ip
@@ -1506,6 +1546,7 @@ class Route(object):
         self.gateway_mac = None
 	self.dst_port = dst_port
 	self.src_port = src_port
+	self.metadata = metadata
 
 class SuspendPacketList(list):
     def __init__(self, timeout_function):
@@ -1703,14 +1744,19 @@ class OfCtl(object):
         actions = [self.dp.ofproto_parser.OFPActionOutput(out_port, 0)]
         self.set_flow(cookie, priority, actions=actions)
 
-    def set_packetin_flow(self, cookie, priority, dl_type=0, dl_dst=0,
-                          dl_vlan=0, dst_ip=0, dst_mask=32, ip_proto=0, tcp_dst=0, tcp_src=0):
+    def set_packetin_flow(self, cookie, priority, outport=0, dl_type=0, 
+                          dl_dst=0,dl_vlan=0, dst_ip=0, dst_mask=32, ip_proto=0, 
+                          tcp_dst=0, tcp_src=0, metadata=0, flag=False):
         miss_send_len = UINT16_MAX
         actions = [self.dp.ofproto_parser.OFPActionOutput(
             self.dp.ofproto.OFPP_CONTROLLER, miss_send_len)]
+	# if outport != 0:
+	#     actions.append(self.dp.ofproto_parser.OFPActionOutput(
+        #     outport, miss_send_len))
         self.set_flow(cookie, priority, dl_type=dl_type, dl_dst=dl_dst,
                       dl_vlan=dl_vlan, nw_dst=dst_ip, dst_mask=dst_mask,
-                      ip_proto=ip_proto, tcp_dst=tcp_dst, tcp_src=tcp_src, actions=actions)
+                      ip_proto=ip_proto, tcp_dst=tcp_dst, tcp_src=tcp_src, 
+                      metadata=metadata, flag=flag, actions=actions)
 
     def send_stats_request(self, stats, waiters):
         self.dp.set_xid(stats)
@@ -1757,7 +1803,8 @@ class OfCtl_v1_0(OfCtl):
 
     def set_flow(self, cookie, priority, dl_type=0, dl_dst=0, dl_vlan=0,
                  nw_src=0, src_mask=32, nw_dst=0, dst_mask=32,
-                 ip_proto=0, idle_timeout=0, tcp_dst=0, tcp_src=0, actions=None):
+                 ip_proto=0, idle_timeout=0, tcp_dst=0, tcp_src=0, 
+                 metadata=0, flag=False, actions=None):
 	self.logger.info('Set Flow by OfCtl ver 1.0',extra=self.sw_id)
 	ofp = self.dp.ofproto
         ofp_parser = self.dp.ofproto_parser
@@ -1860,7 +1907,8 @@ class OfCtl_after_v1_2(OfCtl):
 
     def set_flow(self, cookie, priority, dl_type=0, dl_dst=0, dl_vlan=0,
                  nw_src=0, src_mask=32, nw_dst=0, dst_mask=32,
-                 ip_proto=0, idle_timeout=0, tcp_dst=0, tcp_src=0, actions=None):
+                 ip_proto=0, idle_timeout=0, tcp_dst=0, tcp_src=0, 
+                 metadata=0, flag=False, actions=None):
 	self.logger.info('Set Flow by OfCtl after ver 1.2',extra=self.sw_id)
 	ofp = self.dp.ofproto
         ofp_parser = self.dp.ofproto_parser
@@ -1890,14 +1938,22 @@ class OfCtl_after_v1_2(OfCtl):
 	    match.set_tcp_dst(int(tcp_dst))
 	if tcp_src:
 	    match.set_tcp_src(int(tcp_src))
+	if metadata:
+	    match.set_metadata(int(metadata))
 
         # Instructions
         actions = actions or []
 	if tcp_dst or tcp_src:
 	    actions.append(ofp_parser.OFPActionOutput(
 				self.dp.ofproto.OFPP_NORMAL, miss_send_len))
+	# if flag and metadata > 0:
+	#     actions.append(ofp_parser.OFPActionSetField(
+	# 			metadata=int(metadata)))
         inst = [ofp_parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS,
                                                  actions)]
+
+	if flag and metadata > 0:
+	    inst.append(ofp_parser.OFPInstructionWriteMetadata(int(metadata),META_MASK))
 
         m = ofp_parser.OFPFlowMod(self.dp, cookie, 0, 0, cmd, idle_timeout,
                                   0, priority, UINT32_MAX, ofp.OFPP_ANY,
