@@ -155,6 +155,7 @@ REST_GATEWAY = 'gateway'
 REST_DSTPORT = 'dport'
 REST_SRCPORT = 'sport'
 REST_LABEL = 'label'
+REST_FLOWID = 'flow_id'
 
 PRIORITY_VLAN_SHIFT = 1000
 PRIORITY_NETMASK_SHIFT = 32
@@ -631,7 +632,7 @@ class VlanRouter(object):
         self.port_data = port_data
         self.address_data = AddressData()
         self.routing_tbl = RoutingTable()
-	self.l4data_tbl = {}
+	self.l4data_tbl = FlowTable()
         self.packet_buffer = SuspendPacketList(self.send_icmp_unreach_error)
         self.ofctl = OfCtl.factory(dp, logger)
 
@@ -655,6 +656,8 @@ class VlanRouter(object):
             rest_id = cookie >> COOKIE_SHIFT_VLANID
         elif id_type == REST_ADDRESSID:
             rest_id = cookie & UINT32_MAX
+	elif id_type == REST_FLOWID:
+	    rest_id = (cookie & UINT32_MAX) >> COOKIE_SHIFT_FLOWID
         else:
             assert id_type == REST_ROUTEID
             rest_id = (cookie & UINT32_MAX) >> COOKIE_SHIFT_ROUTEID
@@ -668,6 +671,8 @@ class VlanRouter(object):
             cookie = rest_id << COOKIE_SHIFT_VLANID
         elif id_type == REST_ADDRESSID:
             cookie = vid + rest_id
+	elif id_type == REST_FLOWID:
+	    cookie = vid + (rest_id << COOKIE_SHIFT_FLOWID)
         else:
             assert id_type == REST_ROUTEID
             cookie = vid + (rest_id << COOKIE_SHIFT_ROUTEID)
@@ -1148,6 +1153,11 @@ class VlanRouter(object):
 
 	miss_send_len = UINT16_MAX
 
+	flow_data = self.l4data_tbl.add(srcip,dstip,srcport,dstport)
+	cookie = self._id_to_cookie(REST_FLOWID, flow_data.flow_id)
+	priority = int(dstport)
+
+	'''
 	address = self.address_data.get_data(ip=header_list[IPV4].dst)
 	if address:
 	    route_data = self.routing_tbl.get_data(dst_ip=dstip)
@@ -1155,20 +1165,14 @@ class VlanRouter(object):
             cookie = self._id_to_cookie(REST_ROUTEID, route_data.route_id)
             priority, log_msg = self._get_priority(PRIORITY_TYPE_ROUTE,
                                                route=route_data)
-
+	'''
         
-	flow = '%s/%d-%s/%d' % (srcip,srcport,dstip,dstport)
-	self.l4data_tbl.setdefault(key,{})
-	self.l4data_tbl[key].setdefault(flow,{})
+	# key = '%s/%d-%s/%d' % (srcip,srcport,dstip,dstport)
 
 	if pkt_pay != pkt_tcp:
-	    self.l4data_tbl[key][flow].setdefault('count',0)
-            self.l4data_tbl[key][flow]['count'] += 1
-	    self.l4data_tbl[key][flow].setdefault('flag',False)
-	    self.l4data_tbl[key][flow].setdefault('label',0)	
-	    if (self.l4data_tbl[key][flow]['count'] == 1 and 
-	            pkt_pay.encode('hex')[:16] == '89504e470d0a1a0a'):
-		self.l4data_tbl[key][flow]['flag'] = True
+	    flow_data.count += 1
+	    if flow_data.count == 1 and pkt_pay.encode('hex')[:16] == '89504e470d0a1a0a':
+		flow_data.flag = True
 		self.logger.info('this packet is the first image data!', extra=self.sw_id)
 		'''
 		if address:
@@ -1181,11 +1185,11 @@ class VlanRouter(object):
 		self.logger.info('this data is image!!(first time)',extra=self.sw_id)
 		# mplsなどでタグを付与
 		label = META_IMAGE
-		self.l4data_tbl[key][flow]['label'] = META_IMAGE
+		flow_data.label = label
 		# imageをやり取りしているflow(srcip,srcport,dstip,dstport)
 		# に対してタグを付与するフローエントリを作成
 		
-		self.ofctl.send_flow_l4(cookie, priority, srcip, dstip, srcport, dstport, label, self.l4data_tbl[key][flow]['flag'])
+		self.ofctl.send_flow_l4(cookie, priority, srcip, dstip, srcport, dstport, label, flow_data.flag)
 		'''
 		self.ofctl.set_packetin_flow(cookie, priority,out_port,
                                      dl_type=ether.ETH_TYPE_IP,
@@ -1204,7 +1208,7 @@ class VlanRouter(object):
 		# self.dp.send_msg(m)
 		# self.dp.send_packet_out(buffer_id=UINT32_MAX, in_port=in_port, actions=actions, data=msg.data)
 		self.logger.info('done packet send', extra=self.sw_id)
-	    elif self.l4data_tbl[key][flow]['flag'] == True:
+	    elif flow_data.flag == True:
 		# パケットにmetadataを付与
 		check_type = 'Image!'
 		self.logger.info('this packet is image', extra=self.sw_id)
@@ -1215,23 +1219,21 @@ class VlanRouter(object):
 		# self.dp.send_packet_out(buffer_id=UINT32_MAX, in_port=in_port, actions=actions, data=msg.data)
 	    elif '0000000049454e44' in pkt_pay.encode('hex'):
 		check_type = 'this is finish png'
-		self.l4data_tbl[key][flow]['flag'] = False
+		flow_data.flag = False
 		# フローを削除する
 	    else:
 		check_type = 'not'
 	    f = open('check_img_pkt.txt','a')
             print >> f, check_type
             f.close()
-	    if self.l4data_tbl[key][flow]['count'] == 1:
-	        self.l4data_tbl[key][flow].setdefault('datatype',pkt_pay.encode('hex')[:16])
+	    if flow_data.count == 1:
+	        flow_data.data_h = pkt_pay.encode('hex')[:16])
 	    # f = open('tcp_img_packet.txt','a')
             # print >> f, pkt_pay.encode('hex')
             # f.close()
 	# else:
             # print 'pkt_pay is none'
-	pprint.pprint(self.l4data_tbl)
-	self.logger.info(pprint.pformat(self.l4data_tbl), extra=self.sw_id)
-	self.l4data_tbl[key]
+	#self.logger.info(pprint.pformat(), extra=self.sw_id)
 	# pkt_pay = pkt.protocols[-1]
 	# print pkt_pay
 	# l4data,l4type,payload = pkt_tcp.parser(msg.data)
@@ -1591,9 +1593,11 @@ class FlowTable(dict):
 	super(FlowTable, self).__init__()
 	self.flow_id = 1
 
-    def add(self, srcip, dstip, srcport, dstport, data_h, count, flag)
-	flow_data = Flow(srcip,dstip,srcport,dstport,data_h,count,flag)
+    def add(self, srcip, dstip, srcport, dstport, label=0, data_h=None, count=0, flag=False)
 	key = '%s/%d-%s/%d' % (srcip,srcport,dstip,dstport)
+	if key in self:
+	    return self.get_data(key=key)
+	flow_data = Flow(srcip,dstip,srcport,dstport,label,data_h,count,flag)
 	self[key] = flow_data
 	self.flow_id += 1
 	return flow_data
@@ -1612,13 +1616,14 @@ class FlowTable(dict):
 	    
 
 class Flow(object):
-    def __init__(self, flow_id, srcip, dstip, srcport, dstport, data_h, count, flag)
+    def __init__(self, flow_id, srcip, dstip, srcport, dstport, label, data_h, count, flag)
 	super(Flow, self).__init()__()
 	self.flow_id = flow_id
 	self.srcip = srcip
 	self.dstip = dstip
 	self.srcport = srcport
 	self.dstport = dstport
+	self.label = label
 	self.data_h = data_h
 	self.count = count
 	self.flag = flag
