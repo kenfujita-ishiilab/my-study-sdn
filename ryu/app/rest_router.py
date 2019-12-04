@@ -1132,6 +1132,7 @@ class VlanRouter(object):
                              msg_data=msg.data)
 
 	'''
+	buffer_id = msg.buffer_id
 	datapath = msg.datapath
 	parser = self.dp.ofproto_parser
 	print 'dpid is {}'.format(datapath.id)
@@ -1200,7 +1201,8 @@ class VlanRouter(object):
 		flow_data.label = label
 		# imageをやり取りしているflow(srcip,srcport,dstip,dstport)
 		# に対してタグを付与するフローエントリを作成
-		self.ofctl.send_flow_L4(cookie, priority, dl_vlan=self.vlan_id, srcip=srcip, dstip=dstip, 
+		
+		self.ofctl.send_flow_L4(cookie, priority, buffer_id, dl_vlan=self.vlan_id, srcip=srcip, dstip=dstip, 
 					sport=srcport, dport=dstport, label=flow_data.label, flag=flow_data.flag)
 		'''
 		self.ofctl.set_packetin_flow(cookie, priority,out_port,
@@ -1220,6 +1222,14 @@ class VlanRouter(object):
 		# self.dp.send_msg(m)
 		# self.dp.send_packet_out(buffer_id=UINT32_MAX, in_port=in_port, actions=actions, data=msg.data)
 		self.logger.info('done packet send', extra=self.sw_id)
+		flows = []
+		waiters = {}
+		msgs = self.ofctl.get_all_flow(waiters)
+		for msg in msgs:
+		    for stat in msg.body:
+			flows.append(stat)
+		self.logger.info('Flow status: %s', flows, extra=self.sw_id)
+		#print flows
 		self.send_arp_request(srcip, dstip)
 	    elif flow_data.flag == True:
 		# パケットにmetadataを付与
@@ -1719,11 +1729,13 @@ class OfCtl(object):
                  nw_proto=0, idle_timeout=0, tp_src=0, tp_dst=0, actions=None):
         # Abstract method
         raise NotImplementedError()
-
+    
+    '''
     def set_flow_L4(self, cookie, priority, actions=None, dl_type=0, dl_vlan=0, nw_src=0, nw_dst=0,
                     ip_proto=6, idle_timeout=0, tcp_src=0, tcp_dst=0, metadata=0, flag=False):
 	# Abstract method
         raise NotImplementedError()
+    '''
 
     def send_arp(self, arp_opcode, vlan_id, src_mac, dst_mac,
                  src_ip, dst_ip, arp_target_mac, in_port, output):
@@ -1871,18 +1883,6 @@ class OfCtl(object):
 
         return msgs
 
-    def send_flow_L4(self, cookie, priority, dl_vlan=0, srcip=0, dstip=0, sport=0, dport=0, label=0, flag=False):
-	self.logger.info("send flow l4 now",extra=self.sw_id)
-	miss_send_len = UINT16_MAX
-        actions = [self.dp.ofproto_parser.OFPActionOutput(
-            self.dp.ofproto.OFPP_CONTROLLER, miss_send_len)]
-	self.set_flow_L4(cookie, priority, actions, dl_type=0, dl_vlan=dl_vlan, nw_src=srcip, nw_dst=dstip, 
-			    tcp_src=sport, tcp_dst=dport, metadata=label, flag=flag)
-	'''
-        match = self.ofctl.ofp_parser.OFPMatch(ipv4_src=srcip,ipv4_dst=dstip,tcp_dst='50000',tcp_src=srcport)
-        m = self.ofctl.ofp_parser.OFPFlowMod(self.dp,match,actions=actions)
-        self.dp.send_msg(m)
-	'''
 
 @OfCtl.register_of_version(ofproto_v1_0.OFP_VERSION)
 class OfCtl_v1_0(OfCtl):
@@ -1903,7 +1903,7 @@ class OfCtl_v1_0(OfCtl):
                                                0xff, ofp.OFPP_NONE)
         return self.send_stats_request(stats, waiters)
 
-    def set_flow(self, cookie, priority, dl_type=0, dl_dst=0, dl_vlan=0,
+    def set_flow(self, cookie, priority, buffer_id=None, dl_type=0, dl_dst=0, dl_vlan=0,
                  nw_src=0, src_mask=32, nw_dst=0, dst_mask=32,
                  ip_proto=0, idle_timeout=0, tcp_dst=0, tcp_src=0, 
                  metadata=0, flag=False, actions=None):
@@ -1979,8 +1979,25 @@ class OfCtl_v1_0(OfCtl):
         self.dp.send_msg(flow_mod)
         self.logger.info('Delete flow [cookie=0x%x]', cookie, extra=self.sw_id)
 
+    def send_flow_L4(self, cookie, priority, buffer_id, 
+			dl_vlan=0, srcip=0, dstip=0, sport=0, dport=0, label=0, flag=False):
+        self.logger.info("send flow l4 now",extra=self.sw_id)
+        ofp_parser = self.dp.ofproto_parser
+        miss_send_len = UINT16_MAX
+
+        actions = []
+        if flag:
+            actions.append(ofp_parser.OFPActionSetField(metadata=int(label)))
+            actions.append(ofp_parser.OFPActionOutput(
+                self.dp.ofproto.OFPP_CONTROLLER, miss_send_len))
+
+        self.set_flow(cookie, priority, buffer_id=buffer_id, dl_type=0, dl_vlan=dl_vlan,
+                        nw_src=srcip, src_mask=24, nw_dst=dstip, dst_mask=24, idle_timeout=IDLE_TIMEOUT,
+                        tcp_dst=dport, tcp_src=sport, flag=flag, actions=actions)
+
+    '''
     def set_flow_L4(self, cookie, priority, actions=None, dl_type=0, dl_vlan=0, nw_src=0, nw_dst=0,
-                    ip_proto=6, idle_timeout=0, tcp_src=0, tcp_dst=0, metadata=0, flag=False):
+                    ip_proto=6, idle_timeout=0, tcp_src=0, tcp_dst=0, flag=False):
 	ofp = self.dp.ofproto
         ofp_parser = self.dp.ofproto_parser
 
@@ -1989,7 +2006,7 @@ class OfCtl_v1_0(OfCtl):
 	# match = ofp_parser.OFPMatch(in_port=in_port,ipv4_src=srcip,ipv4_dst=dstip,tcp_dst=50000)
         # m = ofp_parser.OFPFlowMod(self.dp,match,actions=actions)
         # self.dp.send_msg(m)
-
+    '''
 
 class OfCtl_after_v1_2(OfCtl):
 
@@ -2010,7 +2027,7 @@ class OfCtl_after_v1_2(OfCtl):
     def get_all_flow(self, waiters):
         pass
 
-    def set_flow(self, cookie, priority, dl_type=0, dl_dst=0, dl_vlan=0,
+    def set_flow(self, cookie, priority, buffer_id=None, dl_type=0, dl_dst=0, dl_vlan=0,
                  nw_src=0, src_mask=32, nw_dst=0, dst_mask=32,
                  ip_proto=0, idle_timeout=0, tcp_dst=0, tcp_src=0, 
                  metadata=0, flag=False, actions=None):
@@ -2019,6 +2036,11 @@ class OfCtl_after_v1_2(OfCtl):
         ofp_parser = self.dp.ofproto_parser
         cmd = ofp.OFPFC_ADD
 	miss_send_len = UINT16_MAX
+
+	
+	info_flow = 'cookie: {}, priority: {}, dl_type: {}, dl_vlan: {}, dl_dst: {}, nw_src: {}, src_mask: {}, nw_dst: {}, dst_mask: {}, sport: {}, dport: {}'.format(cookie,priority,dl_type,dl_vlan,dl_dst,nw_src,src_mask,nw_dst,dst_mask,tcp_src,tcp_dst)
+        self.logger.info('flow data: {}'.format(info_flow),extra=self.sw_id)
+	
 
         # Match
         match = ofp_parser.OFPMatch()
@@ -2048,19 +2070,23 @@ class OfCtl_after_v1_2(OfCtl):
 
         # Instructions
         actions = actions or []
-	if tcp_dst or tcp_src:
+	if not flag and (tcp_dst or tcp_src):
 	    actions.append(ofp_parser.OFPActionOutput(
 				self.dp.ofproto.OFPP_NORMAL, miss_send_len))
-	# if flag and metadata > 0:
-	#     actions.append(ofp_parser.OFPActionSetField(
-	# 			metadata=int(metadata)))
-        inst = [ofp_parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS,
+	'''
+	if metadata > 0:
+	    actions.append(ofp_parser.OFPActionSetField(metadata=int(metadata)))
+        '''
+
+	inst = [ofp_parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS,
                                                  actions)]
-
-	if flag and metadata > 0:
-	    inst.append(ofp_parser.OFPInstructionWriteMetadata(int(metadata),UINT16_MAX))
-
-        m = ofp_parser.OFPFlowMod(self.dp, cookie, 0, 0, cmd, idle_timeout,
+	if flag and buffer_id:
+	    self.logger.info('flag status: {}'.format(str(flag)), extra=self.sw_id)
+	    m = ofp_parser.OFPFlowMod(self.dp, cookie, 0, 0, cmd, idle_timeout,
+                                  0, priority, buffer_id, ofp.OFPP_ANY,
+                                  ofp.OFPG_ANY, ofp.OFPFF_CHECK_OVERLAP, match, inst)
+	else:	
+            m = ofp_parser.OFPFlowMod(self.dp, cookie, 0, 0, cmd, idle_timeout,
                                   0, priority, UINT32_MAX, ofp.OFPP_ANY,
                                   ofp.OFPG_ANY, 0, match, inst)
         self.dp.send_msg(m)
@@ -2105,9 +2131,30 @@ class OfCtl_after_v1_2(OfCtl):
         self.dp.send_msg(flow_mod)
         self.logger.info('Delete flow [cookie=0x%x]', cookie, extra=self.sw_id)
 	
-    # マッチするIP+ポートのフローに対してlabelをセットするだけのフロー登録
+    def send_flow_L4(self, cookie, priority, buffer_id, 
+			dl_vlan=0, srcip=0, dstip=0, sport=0, dport=0, label=0, flag=False):
+        self.logger.info("send flow l4 now",extra=self.sw_id)
+        ofp_parser = self.dp.ofproto_parser
+        miss_send_len = UINT16_MAX
+	dl_type = ether.ETH_TYPE_IP
+
+        actions = []
+        if flag:
+            actions.append(ofp_parser.OFPActionSetField(metadata=int(label)))
+            actions.append(ofp_parser.OFPActionOutput(
+                self.dp.ofproto.OFPP_CONTROLLER, miss_send_len))
+
+	self.logger.info('actions length: {}'.format(str(len(actions))),extra=self.sw_id)
+	self.logger.info('buffer id: {}'.format(str(buffer_id)),extra=self.sw_id)
+        self.set_flow(cookie, priority, buffer_id=buffer_id, dl_type=dl_type, dl_vlan=dl_vlan, 
+			nw_src=srcip, src_mask=32, nw_dst=dstip, dst_mask=32, ip_proto=6, idle_timeout=IDLE_TIMEOUT, 
+			tcp_dst=dport, tcp_src=sport, flag=flag, actions=actions)
+
+
+# マッチするIP+ポートのフローに対してlabelをセットするだけのフロー登録
+'''
     def set_flow_L4(self, cookie, priority, actions=None, dl_type=0, dl_vlan=0, nw_src=0, nw_dst=0,
-		    ip_proto=6, idle_timeout=0, tcp_src=0, tcp_dst=0, metadata=0, flag=False):
+		    ip_proto=6, idle_timeout=0, tcp_src=0, tcp_dst=0, flag=False):
 	self.logger.info('Set Flow by OfCtl after ver 1.2',extra=self.sw_id)
         ofp = self.dp.ofproto
         ofp_parser = self.dp.ofproto_parser
@@ -2137,26 +2184,28 @@ class OfCtl_after_v1_2(OfCtl):
 
         # Instructions
         actions = actions or []
-	'''
+
         if tcp_dst or tcp_src:
             actions.append(ofp_parser.OFPActionOutput(
                                 self.dp.ofproto.OFPP_NORMAL, miss_send_len))
-        '''
+        
 	if flag:
-            actions.append(ofp_parser.OFPActionSetField(
-                              metadata=metadata))
+            actions.append(ofp_parser.OFPActionSetField(metadata=int(metadata)))
+
         inst = [ofp_parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS,
                                                  actions)]
-	'''
+	
         if flag and metadata > 0:
             inst.append(ofp_parser.OFPInstructionWriteMetadata(int(metadata),UINT16_MAX))
-        '''
+        
 
 	m = ofp_parser.OFPFlowMod(self.dp, cookie, 0, 0, cmd, idle_timeout,
                                   0, priority, UINT32_MAX, ofp.OFPP_ANY,
                                   ofp.OFPG_ANY, 0, match, inst)
+
         self.dp.send_msg(m)    
 	self.logger.info('send L4 flow data msg',extra=self.sw_id)
+'''
 
 @OfCtl.register_of_version(ofproto_v1_2.OFP_VERSION)
 class OfCtl_v1_2(OfCtl_after_v1_2):
