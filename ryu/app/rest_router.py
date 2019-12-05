@@ -131,7 +131,7 @@ VLANID_MAX = 4094
 COOKIE_DEFAULT_ID = 0
 COOKIE_SHIFT_VLANID = 32
 COOKIE_SHIFT_ROUTEID = 16
-COOKIE_SHIFT_FLOWID = 8
+COOKIE_SHIFT_FLOWID = 24
 
 DEFAULT_ROUTE = '0.0.0.0/0'
 IDLE_TIMEOUT = 1800  # sec
@@ -168,7 +168,7 @@ PRIORITY_STATIC_ROUTING = 2
 PRIORITY_IMPLICIT_ROUTING = 3
 PRIORITY_L2_SWITCHING = 4
 PRIORITY_IP_HANDLING = 5
-PRIORITY_L4_HANDLING = 6
+PRIORITY_L4_HANDLING = 24
 
 PRIORITY_TYPE_ROUTE = 'priority_route'
 
@@ -198,8 +198,11 @@ def get_priority(priority_type, vid=0, route=None):
     if priority_type > PRIORITY_STATIC_ROUTING:
         priority += PRIORITY_NETMASK_SHIFT
 
-    if priority_type == PRIORITY_L4_HANDLING:
+    if priority_type == PRIORITY_L4_HANDLING or route:
 	priority += PRIORITY_L4_HANDLING
+	if route:
+	    if route.metadata > 0:
+		priority += int(route.metadata)
     if log_msg is None:
         return priority
     else:
@@ -633,8 +636,11 @@ class VlanRouter(object):
         self.address_data = AddressData()
         self.routing_tbl = RoutingTable()
 	self.l4data_tbl = FlowTable()
+	# self.mac_flow_tbl = TableFlag() 
         self.packet_buffer = SuspendPacketList(self.send_icmp_unreach_error)
         self.ofctl = OfCtl.factory(dp, logger)
+
+	self.mac_flag = {}
 
         # Set flow: default route (drop)
         self._set_defaultroute_drop()
@@ -749,6 +755,7 @@ class VlanRouter(object):
 
 		if REST_LABEL in data:
 		    label = data[REST_LABEL]
+		    self.mac_flag.setdefault(destination,False)
 		else:
 		    label = 0
 
@@ -819,7 +826,9 @@ class VlanRouter(object):
         else:
             src_ip = address.default_gw
             route = self.routing_tbl.add(destination, gateway, dport, sport, label)
-            self._set_route_packetin(route)
+            if int(label) > 0:
+                self.mac_flag.setdefault(route.dst_ip,False)
+	    self._set_route_packetin(route)
             self.send_arp_request(src_ip, dst_ip)
             return route.route_id
 
@@ -845,6 +854,10 @@ class VlanRouter(object):
 	    l4_type=0
 	else:
 	    l4_type=6
+	if route.metadata > 0 and route.dst_ip in self.mac_flag:
+	    self.mac_flag[route.dst_ip] = True
+	
+
         self.ofctl.set_packetin_flow(cookie, priority,
                                      dl_type=ether.ETH_TYPE_IP,
                                      dl_vlan=self.vlan_id,
@@ -1029,6 +1042,7 @@ class VlanRouter(object):
 	    return
 
     def _packetin_arp(self, msg, header_list):
+	self.logger.info('_packetin_arp now',extra=self.sw_id)
         src_addr = self.address_data.get_data(ip=header_list[ARP].src_ip)
         if src_addr is None:
             return
@@ -1209,6 +1223,7 @@ class VlanRouter(object):
 		self.ofctl.send_flow_L4(datapath, cookie, priority, buffer_id, in_port, out_port, 
 					dl_vlan=self.vlan_id, srcip=srcip, dstip=dstip, 
 					sport=srcport, dport=dstport, label=flow_data.label, flag=flow_data.flag)
+		
 		'''
 		self.ofctl.set_packetin_flow(cookie, priority,out_port,
                                      dl_type=ether.ETH_TYPE_IP,
@@ -1221,11 +1236,6 @@ class VlanRouter(object):
 				     mpls_label=label,
 				     labelflag=True)
 		'''
-		# actions = [parser.OFPActionSetField(metadata=label),
-		# 		parser.OFPActionOutput(self.dp.ofproto.OFPP_IN_PORT, 0)]
-		# m = parser.OFPPacketOut(datapath=datapath,buffer_id=self.dp.ofproto.OFP_NO_BUFFER,in_port=in_port,actions=actions,data=msg.data)
-		# self.dp.send_msg(m)
-		# self.dp.send_packet_out(buffer_id=UINT32_MAX, in_port=in_port, actions=actions, data=msg.data)
 		self.logger.info('done packet send', extra=self.sw_id)
 		self.send_arp_request(srcip, dstip)
 	    elif flow_data.flag == True:
@@ -1330,8 +1340,10 @@ class VlanRouter(object):
 
     def send_arp_request(self, src_ip, dst_ip, in_port=None):
         # Send ARP request from all ports.
-	pprint.pprint(self.port_data)
+	self.logger.info('send_arp_request now',extra=self.sw_id)
+	self.logger.info('src_ip: {}, dst_ip: {}'.format(src_ip,dst_ip),extra=self.sw_id)
         for send_port in self.port_data.values():
+	    self.logger.info('portno: {}, mac: {}'.format(send_port.port_no,send_port.mac),extra=self.sw_id)
             if in_port is None or in_port != send_port.port_no:
                 src_mac = send_port.mac
                 dst_mac = mac_lib.BROADCAST_STR
@@ -1362,35 +1374,50 @@ class VlanRouter(object):
 
     def _update_routing_tbl(self, msg, header_list):
         # Set flow: routing to gateway.
+	self.logger.info('_update_routing_tbl now',extra=self.sw_id)
         out_port = self.ofctl.get_packetin_inport(msg)
         src_mac = header_list[ARP].src_mac
         dst_mac = self.port_data[out_port].mac
         src_ip = header_list[ARP].src_ip
 
         gateway_flg = False
+	pprint.pprint(self.mac_flag)
         for key, value in self.routing_tbl.items():
             if value.gateway_ip == src_ip:
                 gateway_flg = True
                 if value.gateway_mac == src_mac:
                     continue
+		if value.dst_ip in self.mac_flag:
+		    if self.mac_flag[value.dst_ip]:
+		        tableid = 1
+			self.mac_flag[value.dst_ip] = False
+		else:
+		    tableid = 0
                 self.routing_tbl[key].gateway_mac = src_mac
 
                 cookie = self._id_to_cookie(REST_ROUTEID, value.route_id)
                 priority, log_msg = self._get_priority(PRIORITY_TYPE_ROUTE,
                                                        route=value)
+		
+		info_flow = 'cookie: {}, priority: {}, outport: {}, dl_vlan: {}, src_mac: {}, dst_mac: {}, nw_dst: {}, dst_mask: {}'.format(cookie,priority,out_port,self.vlan_id,dst_mac,src_mac,value.dst_ip,value.netmask)
+        	self.logger.info('flow data(_update_routing_tbl): {}'.format(info_flow),extra=self.sw_id)
+
+
                 self.ofctl.set_routing_flow(cookie, priority, out_port,
                                             dl_vlan=self.vlan_id,
                                             src_mac=dst_mac,
                                             dst_mac=src_mac,
                                             nw_dst=value.dst_ip,
                                             dst_mask=value.netmask,
-                                            dec_ttl=True)
+                                            dec_ttl=True,
+					    tableid=tableid)
                 self.logger.info('Set %s flow [cookie=0x%x]', log_msg, cookie,
                                  extra=self.sw_id)
         return gateway_flg
 
     def _learning_host_mac(self, msg, header_list):
         # Set flow: routing to internal Host.
+	self.logger.info('_learning_host_mac now',extra=self.sw_id)
         out_port = self.ofctl.get_packetin_inport(msg)
         src_mac = header_list[ARP].src_mac
         dst_mac = self.port_data[out_port].mac
@@ -1402,6 +1429,10 @@ class VlanRouter(object):
             if address is not None:
                 cookie = self._id_to_cookie(REST_ADDRESSID, address.address_id)
                 priority = self._get_priority(PRIORITY_IMPLICIT_ROUTING)
+
+		info_flow = 'cookie: {}, priority: {}, outport: {}, dl_vlan: {}, src_mac: {}, dst_mac: {}, nw_dst: {}'.format(cookie,priority,out_port,self.vlan_id,dst_mac,src_mac,src_ip)
+                self.logger.info('flow data(_learning_host_mac): {}'.format(info_flow),extra=self.sw_id)
+
                 self.ofctl.set_routing_flow(cookie, priority,
                                             out_port, dl_vlan=self.vlan_id,
                                             src_mac=dst_mac, dst_mac=src_mac,
@@ -1608,6 +1639,41 @@ class Route(object):
 	self.src_port = src_port
 	self.metadata = metadata
 
+class TableFlag(dict):
+    def __init__(self):
+	super(TableFlag, self).__init__()
+	self.table_id = 1
+
+    def add(self, dstip, src_mac, dst_mac, flag):
+	key = '%s-%s>%s' % (dstip,src_mac,dst_mac)
+	if key in self:
+	    return self.get_data(key=key)
+	tbl_data = Table(self.table_id, dstip, src_mac, dst_mac, flag)
+        self[key] = tbl_data
+        self.table_id += 1
+        return table_data
+
+    def get_data(self, key=None, dstip=None):
+        if key is not None:
+            return self[key]
+        elif dstip:
+            get_tbl = []
+            for tbl in self.values():
+                if dstip == tbl.dstip:
+                    get_tbl.append(tbl)
+            return get_tbl
+        else:
+            return None
+
+class Table(object):
+    def __init__(self, table_id, dstip, src_mac, dst_mac, flag):
+        super(Flow, self).__init__()
+        self.table_id = table_id
+        self.dstip = dstip
+        self.src_mac = src_mac
+        self.dst_mac = dst_mac
+        self.flag = flag
+
 class FlowTable(dict):
     def __init__(self):
 	super(FlowTable, self).__init__()
@@ -1737,6 +1803,7 @@ class OfCtl(object):
     def send_arp(self, arp_opcode, vlan_id, src_mac, dst_mac,
                  src_ip, dst_ip, arp_target_mac, in_port, output):
         # Generate ARP packet
+	self.logger.info('send_arp now',extra=self.sw_id)
         if vlan_id != VLANID_NONE:
             ether_proto = ether.ETH_TYPE_8021Q
             pcp = 0
@@ -1842,9 +1909,9 @@ class OfCtl(object):
         self.dp.send_packet_out(buffer_id=UINT32_MAX, in_port=in_port,
                                 actions=actions, data=data)
         # TODO: Packet library convert to string
-        # if data_str is None:
-        #     data_str = str(packet.Packet(data))
-        # self.logger.debug('Packet out = %s', data_str, extra=self.sw_id)
+        if data_str is None:
+            data_str = str(packet.Packet(data))
+        self.logger.debug('Packet out = %s', data_str, extra=self.sw_id)
 
     def set_normal_flow(self, cookie, priority):
         out_port = self.dp.ofproto.OFPP_NORMAL
@@ -1942,7 +2009,7 @@ class OfCtl_v1_0(OfCtl):
 
     def set_routing_flow(self, cookie, priority, outport, dl_vlan=0,
                          nw_src=0, src_mask=32, nw_dst=0, dst_mask=32,
-                         src_mac=0, dst_mac=0, idle_timeout=0, **dummy):
+                         src_mac=0, dst_mac=0, idle_timeout=0, tableid=0, **dummy):
 	self.logger.info('Set Routing Flow by OfCtl ver 1.0',extra=self.sw_id)
 	ofp_parser = self.dp.ofproto_parser
 
@@ -2015,13 +2082,13 @@ class OfCtl_after_v1_2(OfCtl):
     def set_flow(self, cookie, priority, buffer_id=None, dl_type=0, dl_dst=0, dl_vlan=0,
                  nw_src=0, src_mask=32, nw_dst=0, dst_mask=32,
                  ip_proto=0, idle_timeout=0, tcp_dst=0, tcp_src=0, 
-                 metadata=0, flag=False, actions=None):
+                 metadata=0, flag=False, actions=None, tableid=0):
 	self.logger.info('Set Flow by OfCtl after ver 1.2',extra=self.sw_id)
 	ofp = self.dp.ofproto
         ofp_parser = self.dp.ofproto_parser
         cmd = ofp.OFPFC_ADD
 	miss_send_len = UINT16_MAX
-	table_id = 0
+	table_id = tableid
 
 	
 	info_flow = 'cookie: {}, priority: {}, dl_type: {}, dl_vlan: {}, dl_dst: {}, nw_src: {}, src_mask: {}, nw_dst: {}, dst_mask: {}, sport: {}, dport: {}'.format(cookie,priority,dl_type,dl_vlan,dl_dst,nw_src,src_mask,nw_dst,dst_mask,tcp_src,tcp_dst)
@@ -2083,7 +2150,7 @@ class OfCtl_after_v1_2(OfCtl):
 
     def set_routing_flow(self, cookie, priority, outport, dl_vlan=0,
                          nw_src=0, src_mask=32, nw_dst=0, dst_mask=32,
-                         src_mac=0, dst_mac=0, idle_timeout=0, dec_ttl=False):
+                         src_mac=0, dst_mac=0, idle_timeout=0, dec_ttl=False, tableid=0):
 	self.logger.info('Set Routing Flow by OfCtl after ver 1.2',extra=self.sw_id)
 	ofp = self.dp.ofproto
         ofp_parser = self.dp.ofproto_parser
@@ -2103,7 +2170,7 @@ class OfCtl_after_v1_2(OfCtl):
         self.set_flow(cookie, priority, dl_type=dl_type, dl_vlan=dl_vlan,
                       nw_src=nw_src, src_mask=src_mask,
                       nw_dst=nw_dst, dst_mask=dst_mask,
-                      idle_timeout=idle_timeout, actions=actions)
+                      idle_timeout=idle_timeout, actions=actions, tableid=tableid)
 
     def delete_flow(self, flow_stats):
         ofp = self.dp.ofproto
@@ -2140,9 +2207,6 @@ class OfCtl_after_v1_2(OfCtl):
         self.set_flow(cookie, priority, buffer_id=buffer_id, dl_type=dl_type, dl_vlan=dl_vlan, 
 			nw_src=srcip, src_mask=32, nw_dst=dstip, dst_mask=32, ip_proto=6, idle_timeout=IDLE_TIMEOUT, 
 			tcp_dst=dport, tcp_src=sport, metadata=label, flag=flag, actions=actions)
-
-	out = ofp_parser.OFPPacketOut(datapath, buffer_id, in_port, actions)
-	datapath.send_msg(out)
 
 
 # マッチするIP+ポートのフローに対してlabelをセットするだけのフロー登録
