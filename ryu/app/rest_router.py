@@ -14,6 +14,7 @@
 # limitations under the License.
 
 
+from operator import attrgetter
 import logging
 import numbers
 import socket
@@ -30,7 +31,7 @@ from ryu.base import app_manager
 from ryu.controller import dpset
 from ryu.controller import ofp_event
 from ryu.controller.handler import set_ev_cls
-from ryu.controller.handler import MAIN_DISPATCHER
+from ryu.controller.handler import MAIN_DISPATCHER,DEAD_DISPATCHER
 from ryu.exception import OFPUnknownVersion
 from ryu.exception import RyuException
 from ryu.lib import dpid as dpid_lib
@@ -177,6 +178,10 @@ META_IMAGE = 10
 META_VIDEO = 100
 META_MASK = 0xffff
 
+REPLY_FLOW_STATS = 'flow_stats'
+REPLY_PORT_STATS = 'port_stats'
+REPLY_PORT_DESC = 'port_desc'
+
 def get_priority(priority_type, vid=0, route=None):
     log_msg = None
     priority = priority_type
@@ -241,6 +246,7 @@ class RestRouterAPI(app_manager.RyuApp):
         wsgi = kwargs['wsgi']
         self.waiters = {}
         self.data = {'waiters': self.waiters}
+	self.datapaths = {}
 
         mapper = wsgi.mapper
         wsgi.registory['RouterController'] = self.data
@@ -318,8 +324,30 @@ class RestRouterAPI(app_manager.RyuApp):
 
     # TODO: Update routing table when port status is changed.
 
+    @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
+    def _state_change_handler(self, ev):
+        datapath = ev.datapath
+        if ev.state == MAIN_DISPATCHER:
+            if datapath.id not in self.datapaths:
+                self.logger.debug('register datapath: %016x', datapath.id)
+                self.datapaths[datapath.id] = datapath
+        elif ev.state == DEAD_DISPATCHER:
+            if datapath.id in self.datapaths:
+                self.logger.debug('unregister datapath: %016x', datapath.id)
+                del self.datapaths[datapath.id]
 
-# REST command template
+    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
+    def _flow_stats_reply_handler(self, ev):
+        RouterController.reply_stats_message(ev.msg,REPLY_FLOW_STATS)
+
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    def _port_stats_reply_handler(self, ev):
+	RouterController.reply_stats_message(ev.msg,REPLY_PORT_STATS)
+
+    @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
+    def port_desc_stats_reply_handler(self, ev):
+        RouterController.reply_stats_message(ev.msg,REPLY_PORT_DESC)
+
 def rest_command(func):
     def _rest_command(*args, **kwargs):
         try:
@@ -349,6 +377,7 @@ class RouterController(ControllerBase):
 
     _ROUTER_LIST = {}
     _LOGGER = None
+    _LINK_STATE = {}
 
     def __init__(self, req, link, data, **config):
         super(RouterController, self).__init__(req, link, data, **config)
@@ -392,7 +421,63 @@ class RouterController(ControllerBase):
         if dp_id in cls._ROUTER_LIST:
             router = cls._ROUTER_LIST[dp_id]
             router.packet_in_handler(msg)
+    
+    @classmethod
+    def reply_stats_message(cls, msg, name):
+	dp_id = msg.datapath.id
+	cls._LINK_STATE.setdefault(dp_id,{})
+	if name == 'flow_stats':
+	    cls._flow_stats_reply(msg)
+	elif name == 'port_stats':
+	    cls._port_stats_reply(msg)
+	elif name == 'port_desc':
+            cls._port_desc_reply(msg)
+	else:
+	    return
 
+    @classmethod
+    def _flow_stats_reply(cls, msg):
+	dpid = {'sw_id': dpid_lib.dpid_to_str(msg.datapath.id)}
+        for stat in sorted([flow for flow in msg.body if flow.priority == 60],
+                           key=lambda flow: (flow.match['ipv4_dst'])):
+                cls._LOGGER.info('%8x %17s %8x %8d %8d',
+                             stat.match['out_port'], stat.match['ipv4_dst'],
+                             stat.instructions[0].actions[0].port,
+                             stat.packet_count, stat.byte_count, extra=dpid)
+
+    @classmethod
+    def _port_stats_reply(cls, msg):
+	dpid = {'sw_id': dpid_lib.dpid_to_str(msg.datapath.id)}
+        body = msg.body
+        for stat in sorted(body, key=attrgetter('port_no')):
+	    if len(str(stat.port_no)) > 2:
+		continue
+	    cls._LINK_STATE[(msg.datapath.id, stat.port_no)].setdefault('bef_rx_packet',0)
+            cls._LINK_STATE[(msg.datapath.id, stat.port_no)].setdefault('bef_rx_bytes',0)
+	    cls._LINK_STATE[(msg.datapath.id, stat.port_no)].setdefault('rx_packet',stat.rx_packets)
+	    cls._LINK_STATE[(msg.datapath.id, stat.port_no)].setdefault('rx_bytes',stat.rx_bytes)
+            cls._LOGGER.info('%8x %8d %8d %8d %8d %8d %8d',
+                             stat.port_no,
+                             stat.rx_packets, stat.rx_bytes, stat.rx_errors,
+                             stat.tx_packets, stat.tx_bytes, stat.tx_errors, extra=dpid)
+	    link_speed = cls._LINK_STATE[(msg.datapath.id, stat.port_no)]['speed']
+	    before_bytes = cls._LINK_STATE[(msg.datapath.id, stat.port_no)]['bef_rx_bytes']
+	    now_rx_bytes = before_bytes-stat.rx_bytes if before_bytes > 0 else stat.rx_bytes
+	    cls._LINK_STATE[(msg.datapath.id, stat.port_no)].setdefault('bandwidth',now_rx_bytes/link_speed)
+            cls._LOGGER.info('bw: %8f bps',cls._LINK_STATE[(msg.datapath.id, stat.port_no)]['bandwidth'],extra=dpid)
+	    # print '{:016x}s {:8x} port rx:{:8d}, tx:{:8d}'.format(
+            #                       ev.msg.datapath.id,stat.port_no,stat.rx_packets,stat.tx_packets)
+
+    @classmethod
+    def _port_desc_reply(cls, msg):
+	dpid = {'sw_id': dpid_lib.dpid_to_str(msg.datapath.id)}
+	for p in msg.body:
+	    if len(str(p.port_no)) > 2:
+                continue
+	    cls._LINK_STATE.setdefault((msg.datapath.id, p.port_no),{})
+	    cls._LINK_STATE[(msg.datapath.id, p.port_no)].setdefault('speed',p.curr_speed)
+            cls._LOGGER.info('%d %s %d %d',p.port_no, p.name, p.curr_speed, p.max_speed, extra=dpid)	
+	
     # GET /router/{switch_id}
     @rest_command
     def get_data(self, req, switch_id, **_kwargs):
@@ -466,6 +551,7 @@ class Router(dict):
         self.dpid_str = dpid_lib.dpid_to_str(dp.id)
         self.sw_id = {'sw_id': self.dpid_str}
         self.logger = logger
+	self.obsr_waiters = {}
 
         # print "show datapath ports"
 	# print dp.ports
@@ -502,6 +588,10 @@ class Router(dict):
         # Start cyclic routing table check.
         self.thread = hub.spawn(self._cyclic_update_routing_tbl)
         self.logger.info('Start cyclic routing table update.',
+                         extra=self.sw_id)
+	# Start cyclic observing link state.
+        self.monitor_thread = hub.spawn(self._monitor)
+	self.logger.info('Start cyclic observing link state.',
                          extra=self.sw_id)
 
     def delete(self):
@@ -614,6 +704,10 @@ class Router(dict):
                 self.logger.debug('Drop unknown vlan packet. [vlan_id=%d]',
                                   vlan_id, extra=self.sw_id)
 
+    def reply_stats_message(self, msg):
+	self.logger.info(msg.body,extra=self.sw_id)
+
+
     def _cyclic_update_routing_tbl(self):
         while True:
             # send ARP to all gateways.
@@ -624,6 +718,13 @@ class Router(dict):
             hub.sleep(CHK_ROUTING_TBL_INTERVAL)
 
 
+    def _monitor(self):
+        while True:
+            for vlan_router in self.values():
+                vlan_router.observe_status(self.obsr_waiters)
+            hub.sleep(3)
+
+    
 class VlanRouter(object):
     def __init__(self, vlan_id, dp, port_data, logger):
         super(VlanRouter, self).__init__()
@@ -655,6 +756,12 @@ class VlanRouter(object):
                     self.ofctl.delete_flow(stats)
 
         assert len(self.packet_buffer) == 0
+
+    def observe_status(self,waiters):
+	flowstat, portstat, descstat = self.ofctl._request_stats(waiters)
+	print 'flowstat: {}'.format(flowstat)
+	print 'portstat: {}'.format(portstat)
+	print 'descstat: {}'.format(descstat)
 
     @staticmethod
     def _cookie_to_id(id_type, cookie):
@@ -2321,6 +2428,23 @@ class OfCtl_v1_3(OfCtl_after_v1_2):
                                                ofp.OFPG_ANY, 0, 0, match)
         return self.send_stats_request(stats, waiters)
 
+    def _request_stats(self, waiters):
+        self.logger.debug('send stats request: %016x', self.dp.id)
+        ofp = self.dp.ofproto
+        ofp_parser = self.dp.ofproto_parser
+	match = ofp_parser.OFPMatch()
+
+        req = ofp_parser.OFPFlowStatsRequest(self.dp, 0, ofp.OFPTT_ALL, ofp.OFPP_ANY,
+						ofp.OFPG_ANY, 0, 0, match)
+	rep_flow = self.send_stats_request(req,waiters)
+
+        req = ofp_parser.OFPPortStatsRequest(self.dp, 0, ofp.OFPP_ANY)
+	rep_port = self.send_stats_request(req,waiters)
+
+	req = ofp_parser.OFPPortDescStatsRequest(self.dp, 0)
+	rep_podesc = self.send_stats_request(req,waiters)
+
+	return rep_flow,rep_port,rep_podesc
 
 def ip_addr_aton(ip_str, err_msg=None):
     try:
