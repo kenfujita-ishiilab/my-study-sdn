@@ -23,6 +23,7 @@ import struct
 import json
 import pprint
 import binascii
+import datetime
 
 from ryu.app.wsgi import ControllerBase
 from ryu.app.wsgi import Response
@@ -181,6 +182,7 @@ META_MASK = 0xffff
 REPLY_FLOW_STATS = 'flow_stats'
 REPLY_PORT_STATS = 'port_stats'
 REPLY_PORT_DESC = 'port_desc'
+REPLY_BARRIER = 'barrier'
 
 def get_priority(priority_type, vid=0, route=None):
     log_msg = None
@@ -348,6 +350,10 @@ class RestRouterAPI(app_manager.RyuApp):
     def port_desc_stats_reply_handler(self, ev):
         RouterController.reply_stats_message(ev.msg,REPLY_PORT_DESC)
 
+    @set_ev_cls(ofp_event.EventOFPBarrierReply, MAIN_DISPATCHER)
+    def barrier_reply_handler(self, ev):
+	RouterController.reply_stats_message(ev.msg,REPLY_BARRIER)
+
 def rest_command(func):
     def _rest_command(*args, **kwargs):
         try:
@@ -425,6 +431,7 @@ class RouterController(ControllerBase):
     @classmethod
     def reply_stats_message(cls, msg, name):
 	dp_id = msg.datapath.id
+	dpid = {'sw_id': dpid_lib.dpid_to_str(dp_id)}
 	cls._LINK_STATE.setdefault(dp_id,{})
 	if name == 'flow_stats':
 	    cls._flow_stats_reply(msg)
@@ -432,17 +439,18 @@ class RouterController(ControllerBase):
 	    cls._port_stats_reply(msg)
 	elif name == 'port_desc':
             cls._port_desc_reply(msg)
+	elif name == 'barrier':
+	    cls._LOGGER.info('reply barrier so, done record flow entry!', extra=dpid)
 	else:
 	    return
 
     @classmethod
     def _flow_stats_reply(cls, msg):
 	dpid = {'sw_id': dpid_lib.dpid_to_str(msg.datapath.id)}
-        for stat in sorted([flow for flow in msg.body if flow.priority == 60],
+        for stat in sorted([flow for flow in msg.body if flow.match['ipv4_dst']],
                            key=lambda flow: (flow.match['ipv4_dst'])):
-                cls._LOGGER.info('%8x %17s %8x %8d %8d',
-                             stat.match['out_port'], stat.match['ipv4_dst'],
-                             stat.instructions[0].actions[0].port,
+                cls._LOGGER.info('%17s %8d %8d',
+                             stat.match['ipv4_dst'],
                              stat.packet_count, stat.byte_count, extra=dpid)
 
     @classmethod
@@ -454,19 +462,25 @@ class RouterController(ControllerBase):
 		continue
 	    cls._LINK_STATE[(msg.datapath.id, stat.port_no)].setdefault('bef_rx_packet',0)
             cls._LINK_STATE[(msg.datapath.id, stat.port_no)].setdefault('bef_rx_bytes',0)
-	    cls._LINK_STATE[(msg.datapath.id, stat.port_no)].setdefault('rx_packet',stat.rx_packets)
-	    cls._LINK_STATE[(msg.datapath.id, stat.port_no)].setdefault('rx_bytes',stat.rx_bytes)
-            cls._LOGGER.info('%8x %8d %8d %8d %8d %8d %8d',
-                             stat.port_no,
-                             stat.rx_packets, stat.rx_bytes, stat.rx_errors,
-                             stat.tx_packets, stat.tx_bytes, stat.tx_errors, extra=dpid)
+
 	    link_speed = cls._LINK_STATE[(msg.datapath.id, stat.port_no)]['speed']
-	    before_bytes = cls._LINK_STATE[(msg.datapath.id, stat.port_no)]['bef_rx_bytes']
-	    now_rx_bytes = before_bytes-stat.rx_bytes if before_bytes > 0 else stat.rx_bytes
-	    cls._LINK_STATE[(msg.datapath.id, stat.port_no)].setdefault('bandwidth',now_rx_bytes/link_speed)
-            cls._LOGGER.info('bw: %8f bps',cls._LINK_STATE[(msg.datapath.id, stat.port_no)]['bandwidth'],extra=dpid)
-	    # print '{:016x}s {:8x} port rx:{:8d}, tx:{:8d}'.format(
-            #                       ev.msg.datapath.id,stat.port_no,stat.rx_packets,stat.tx_packets)
+            before_bytes = cls._LINK_STATE[(msg.datapath.id, stat.port_no)]['bef_rx_bytes']
+            now_rx_bytes = before_bytes-stat.rx_bytes if before_bytes > 0 else stat.rx_bytes
+
+	    
+            # cls._LOGGER.info('%8x %8d %8d %8d %8d %8d %8d',
+            #                  stat.port_no,
+            #                  stat.rx_packets, stat.rx_bytes, stat.rx_errors,
+            #                  stat.tx_packets, stat.tx_bytes, stat.tx_errors, extra=dpid)
+
+	    cls._LINK_STATE[(msg.datapath.id, stat.port_no)]['bef_rx_bytes'] = stat.rx_bytes
+            cls._LINK_STATE[(msg.datapath.id, stat.port_no)]['bef_rx_packet'] = stat.rx_packets
+
+	    cls._LINK_STATE[(msg.datapath.id, stat.port_no)].setdefault('bandwidth',
+				(float(now_rx_bytes)/(float(link_speed)*1000.0))*100.0)
+	    cls._LINK_STATE[(msg.datapath.id, stat.port_no)]['bandwidth'] = (float(now_rx_bytes)/(float(link_speed)*1000.0))*100.0
+            cls._LOGGER.info(datetime.datetime.now(), extra=dpid)
+	    cls._LOGGER.info('use of bandwidth: %8f bps',cls._LINK_STATE[(msg.datapath.id, stat.port_no)]['bandwidth'],extra=dpid)
 
     @classmethod
     def _port_desc_reply(cls, msg):
@@ -476,6 +490,7 @@ class RouterController(ControllerBase):
                 continue
 	    cls._LINK_STATE.setdefault((msg.datapath.id, p.port_no),{})
 	    cls._LINK_STATE[(msg.datapath.id, p.port_no)].setdefault('speed',p.curr_speed)
+	    cls._LINK_STATE[(msg.datapath.id, p.port_no)]['speed'] = p.curr_speed
             cls._LOGGER.info('%d %s %d %d',p.port_no, p.name, p.curr_speed, p.max_speed, extra=dpid)	
 	
     # GET /router/{switch_id}
@@ -1139,17 +1154,20 @@ class VlanRouter(object):
                 if ICMP in header_list:
                     if header_list[ICMP].type == icmp.ICMP_ECHO_REQUEST:
                         self._packetin_icmp_req(msg, header_list)
-            else:
+	    # elif TCP in header_list or UDP in header_list:
+                # self._packetin_tcp_udp(msg, header_list)
+	    else:
                 # Packet to internal host or gateway router.
                 self._packetin_to_node(msg, header_list)
-
+	    
 	    if TCP in header_list or UDP in header_list:
                 self._packetin_tcp_udp(msg, header_list)
+	    
 
 	    return
 
     def _packetin_arp(self, msg, header_list):
-	self.logger.info('_packetin_arp now',extra=self.sw_id)
+	# self.logger.info('_packetin_arp now',extra=self.sw_id)
         src_addr = self.address_data.get_data(ip=header_list[ARP].src_ip)
         if src_addr is None:
             return
@@ -1184,6 +1202,9 @@ class VlanRouter(object):
             if (dst_addr is not None and
                     src_addr.address_id == dst_addr.address_id):
                 # ARP from internal host -> packet forward (normal)
+		self.logger.info('dst_ip: %s src_ip: %s dst_id: %s src_id: %s',
+			dst_ip, src_ip, str(dst_addr.address_id), str(src_addr.address_id),
+			extra=self.sw_id)
                 output = self.ofctl.dp.ofproto.OFPP_NORMAL
                 self.ofctl.send_packet_out(in_port, output, msg.data)
 
@@ -1284,33 +1305,18 @@ class VlanRouter(object):
 	flow_data = self.l4data_tbl.add(srcip,dstip,srcport,dstport)
 	cookie = self._id_to_cookie(REST_FLOWID, flow_data.flow_id)
 	priority = self._get_priority(PRIORITY_L4_HANDLING)
+	flow_data.pkt_count += 1
 
-	#str_cookie = 'cookie type={}, cookie={}'.format(type(cookie),str(cookie))
-        #str_priority = 'priority type={}, priority={}'.format(type(priority),str(priority))
-        #self.logger.info(str_cookie,extra=self.sw_id)
-        #self.logger.info(str_priority,extra=self.sw_id)
-
-
-	'''
-	address = self.address_data.get_data(ip=header_list[IPV4].dst)
-	if address:
-	    route_data = self.routing_tbl.get_data(dst_ip=dstip)
-	    self.logger.info(pprint.pformat(route_data), extra=self.sw_id)
-            cookie = self._id_to_cookie(REST_ROUTEID, route_data.route_id)
-            priority, log_msg = self._get_priority(PRIORITY_TYPE_ROUTE,
-                                               route=route_data)
-	'''
-        
-	# key = '%s/%d-%s/%d' % (srcip,srcport,dstip,dstport)
-
-	if pkt_pay != pkt_tcp:
+	if pkt_pay != pkt_tcp and datapath.id == 3:
 	    flow_data.count += 1
 	    if flow_data.count == 1 and pkt_pay.encode('hex')[:16] == '89504e470d0a1a0a':
 		flow_data.flag = True
 		if datapath.id == 3:
 		    out_port = 2
+		elif datapath.id == 4:
+		    out_port = 3
 		else:
-		    out_port = 0
+		    out_port = self.ofctl.dp.ofproto.OFPP_NORMAL
 		self.logger.info('this packet is the first image data!', extra=self.sw_id)
 		'''
 		if address:
@@ -1321,18 +1327,19 @@ class VlanRouter(object):
 		'''
 		check_type = 'this is png'
 		self.logger.info('this data is image!!(first time)',extra=self.sw_id)
-		# mplsなどでタグを付与
-		label = META_IMAGE
-		flow_data.label = label
-		# imageをやり取りしているflow(srcip,srcport,dstip,dstport)
-		# に対してタグを付与するフローエントリを作成
+		if datapath.id == 3:
+		    # mplsなどでタグを付与
+		    label = META_IMAGE
+		    flow_data.label = label
+		    # imageをやり取りしているflow(srcip,srcport,dstip,dstport)
+		    # に対してタグを付与するフローエントリを作成
 		
-		self.ofctl.send_flow_L4(datapath, cookie, priority, buffer_id, in_port, out_port, 
-					dl_vlan=self.vlan_id, srcip=srcip, dstip=dstip, 
-					sport=srcport, dport=dstport, label=flow_data.label, flag=flow_data.flag)
+		    self.ofctl.send_flow_L4(datapath, cookie, priority, buffer_id, in_port, out_port, 
+		    			dl_vlan=self.vlan_id, srcip=srcip, dstip=dstip, 
+		    			sport=srcport, dport=dstport, label=flow_data.label, flag=flow_data.flag)
 		
-		'''
-		self.ofctl.set_packetin_flow(cookie, priority,out_port,
+		    '''
+		    self.ofctl.set_packetin_flow(cookie, priority,out_port,
                                      dl_type=ether.ETH_TYPE_IP,
                                      dl_vlan=self.vlan_id,
                                      dst_ip=route.dst_ip,
@@ -1342,9 +1349,10 @@ class VlanRouter(object):
                                      tcp_src=route.src_port,
 				     mpls_label=label,
 				     labelflag=True)
-		'''
-		self.logger.info('done packet send', extra=self.sw_id)
-		self.send_arp_request(srcip, dstip)
+		    '''
+		    self.logger.info('done packet send', extra=self.sw_id)
+		    self.ofctl.send_packet_out(in_port, self.dp.ofproto.OFPP_TABLE, msg.data)
+		    self.send_arp_request(srcip, dstip)
 	    elif flow_data.flag == True:
 		# パケットにmetadataを付与
 		check_type = 'Image!'
@@ -1360,16 +1368,16 @@ class VlanRouter(object):
 		# フローを削除する
 	    else:
 		check_type = 'not'
-	    f = open('check_img_pkt.txt','a')
-            print >> f, check_type
-            f.close()
+	    
 	    if flow_data.count == 1:
 	        flow_data.data_h = pkt_pay.encode('hex')[:16]
 	    # f = open('tcp_img_packet.txt','a')
             # print >> f, pkt_pay.encode('hex')
             # f.close()
-	# else:
-            # print 'pkt_pay is none'
+	else:
+            print 'pkt_pay is none'
+	    if flow_data.pkt_count == 1:
+	        self.send_arp_request(srcip, dstip)
 	#self.logger.info(pprint.pformat(), extra=self.sw_id)
 	# pkt_pay = pkt.protocols[-1]
 	# print pkt_pay
@@ -1417,11 +1425,12 @@ class VlanRouter(object):
                 if gw_address is not None:
                     src_ip = gw_address.default_gw
                     dst_ip = route.gateway_ip
-
+	'''
         if src_ip is not None:
             self.packet_buffer.add(in_port, header_list, msg.data)
             self.send_arp_request(src_ip, dst_ip, in_port=in_port)
             self.logger.info('Send ARP request (flood)', extra=self.sw_id)
+	'''
 
     def _packetin_invalid_ttl(self, msg, header_list):
         # Send ICMP TTL error.
@@ -1441,6 +1450,7 @@ class VlanRouter(object):
 
     def send_arp_all_gw(self):
         gateways = self.routing_tbl.get_gateways()
+	self.logger.info(gateways,extra=self.sw_id)
         for gateway in gateways:
             address = self.address_data.get_data(ip=gateway)
             self.send_arp_request(address.default_gw, gateway)
@@ -1599,6 +1609,7 @@ class AddressData(dict):
         err_msg = 'Invalid [%s] value.' % REST_ADDRESS
         nw_addr, mask, default_gw = nw_addr_aton(address, err_msg=err_msg)
 
+	print '{} {} {}'.format(nw_addr, mask, default_gw)
         # Check overlaps
         for other in self.values():
             other_mask = mask_ntob(other.netmask)
@@ -1819,6 +1830,7 @@ class Flow(object):
 	self.label = label
 	self.data_h = data_h
 	self.count = count
+	self.pkt_count = 0
 	self.flag = flag
 
 class SuspendPacketList(list):
@@ -2022,15 +2034,19 @@ class OfCtl(object):
 
     def set_normal_flow(self, cookie, priority):
         out_port = self.dp.ofproto.OFPP_NORMAL
-        actions = [self.dp.ofproto_parser.OFPActionOutput(out_port, 0)]
+        # actions = [self.dp.ofproto_parser.OFPActionOutput(out_port, 0)]
+	actions = []
         self.set_flow(cookie, priority, actions=actions)
 
     def set_packetin_flow(self, cookie, priority, outport=0, dl_type=0, 
                           dl_dst=0,dl_vlan=0, dst_ip=0, dst_mask=32, ip_proto=0, 
                           tcp_dst=0, tcp_src=0, metadata=0, flag=False):
         miss_send_len = UINT16_MAX
-        actions = [self.dp.ofproto_parser.OFPActionOutput(
-            self.dp.ofproto.OFPP_CONTROLLER, miss_send_len)]
+	if (metadata or (tcp_dst or tcp_src)) and self.dp.id != 3:
+	    actions = []
+	else:
+            actions = [self.dp.ofproto_parser.OFPActionOutput(
+                self.dp.ofproto.OFPP_CONTROLLER, miss_send_len)]
 	# if outport != 0:
 	#     actions.append(self.dp.ofproto_parser.OFPActionOutput(
         #     outport, miss_send_len))
@@ -2226,7 +2242,7 @@ class OfCtl_after_v1_2(OfCtl):
 	if tcp_src:
 	    match.set_tcp_src(int(tcp_src))
 	if metadata and not flag:
-	    # match.set_metadata(int(metadata))
+	    match.set_metadata(int(metadata))
 	    table_id = 1
 
         # Instructions
@@ -2234,10 +2250,6 @@ class OfCtl_after_v1_2(OfCtl):
 	if not flag and (tcp_dst or tcp_src):
 	    actions.append(ofp_parser.OFPActionOutput(
 				self.dp.ofproto.OFPP_NORMAL, miss_send_len))
-	'''
-	if metadata > 0:
-	    actions.append(ofp_parser.OFPActionSetField(metadata=int(metadata)))
-        '''
 
 	inst = [ofp_parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS,
                                                  actions)]
@@ -2249,11 +2261,19 @@ class OfCtl_after_v1_2(OfCtl):
 	    m = ofp_parser.OFPFlowMod(self.dp, cookie, 0, table_id, cmd, idle_timeout,
                                   0, priority, buffer_id, ofp.OFPP_ANY,
                                   ofp.OFPG_ANY, ofp.OFPFF_CHECK_OVERLAP, match, inst)
+	elif metadata and not flag and (tcp_dst or tcp_src):
+	    inst.append(ofp_parser.OFPInstructionGotoTable(1))
+            m = ofp_parser.OFPFlowMod(self.dp, cookie, 0, table_id, cmd, idle_timeout,
+                                  0, priority, UINT32_MAX, ofp.OFPP_ANY,
+                                  ofp.OFPG_ANY, 0, match, inst)
 	else:	
             m = ofp_parser.OFPFlowMod(self.dp, cookie, 0, table_id, cmd, idle_timeout,
                                   0, priority, UINT32_MAX, ofp.OFPP_ANY,
                                   ofp.OFPG_ANY, 0, match, inst)
         self.dp.send_msg(m)
+
+	barrier_req = ofp_parser.OFPBarrierRequest(self.dp)
+	self.dp.send_msg(barrier_req)
 
     def set_routing_flow(self, cookie, priority, outport, dl_vlan=0,
                          nw_src=0, src_mask=32, nw_dst=0, dst_mask=32,
