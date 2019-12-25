@@ -19,6 +19,7 @@ import logging
 import numbers
 import socket
 import struct
+import time
 
 import json
 import pprint
@@ -43,6 +44,7 @@ from ryu.lib.packet import arp
 from ryu.lib.packet import ethernet
 from ryu.lib.packet import icmp
 from ryu.lib.packet import ipv4
+from ryu.lib.packet import lldp
 from ryu.lib.packet import packet
 from ryu.lib.packet import packet_base
 from ryu.lib.packet import tcp
@@ -53,6 +55,7 @@ from ryu.ofproto import inet
 from ryu.ofproto import ofproto_v1_0
 from ryu.ofproto import ofproto_v1_2
 from ryu.ofproto import ofproto_v1_3
+from ryu.topology.switches import LLDPPacket
 
 
 # =============================
@@ -111,6 +114,7 @@ UINT64_MAX = 0xffffffffffffffff
 
 ETHERNET = ethernet.ethernet.__name__
 VLAN = vlan.vlan.__name__
+LLDP = lldp.lldp.__name__
 IPV4 = ipv4.ipv4.__name__
 ARP = arp.arp.__name__
 ICMP = icmp.icmp.__name__
@@ -250,10 +254,15 @@ class RestRouterAPI(app_manager.RyuApp):
         self.data = {'waiters': self.waiters}
 	self.datapaths = {}
 
+	self.flowwaiter = {}
+	RouterController._FLOW_WAITER = self.flowwaiter
+
         mapper = wsgi.mapper
         wsgi.registory['RouterController'] = self.data
         requirements = {'switch_id': SWITCHID_PATTERN,
                         'vlan_id': VLANID_PATTERN}
+
+	# RouterController._FLOW_WAITER = self.data['waiters']
 
         # For no vlan data
         path = '/router/{switch_id}'
@@ -298,11 +307,15 @@ class RestRouterAPI(app_manager.RyuApp):
     def _stats_reply_handler(self, ev):
         msg = ev.msg
         dp = msg.datapath
+	print('waiter(reply): {}'.format(id(self.flowwaiter)))
 
-        if (dp.id not in self.waiters
-                or msg.xid not in self.waiters[dp.id]):
+	# print RouterController._FLOW_WAITER
+
+        if (dp.id not in self.flowwaiter
+                or msg.xid not in self.flowwaiter[dp.id]):
             return
-        event, msgs = self.waiters[dp.id][msg.xid]
+        event, msgs = self.flowwaiter[dp.id][msg.xid]
+	print('msgs(reply): {}'.format(id(msgs)))
         msgs.append(msg)
 
         if ofproto_v1_3.OFP_VERSION == dp.ofproto.OFP_VERSION:
@@ -310,19 +323,14 @@ class RestRouterAPI(app_manager.RyuApp):
         else:
             more = dp.ofproto.OFPSF_REPLY_MORE
         if msg.flags & more:
-            return
-        del self.waiters[dp.id][msg.xid]
+            print "more"
+	    return
+        del self.flowwaiter[dp.id][msg.xid]
+	print "del data"
         event.set()
+	print msgs
+	
 
-    # for OpenFlow version1.0
-    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
-    def stats_reply_handler_v1_0(self, ev):
-        self._stats_reply_handler(ev)
-
-    # for OpenFlow version1.2/1.3
-    @set_ev_cls(ofp_event.EventOFPStatsReply, MAIN_DISPATCHER)
-    def stats_reply_handler_v1_2(self, ev):
-        self._stats_reply_handler(ev)
 
     # TODO: Update routing table when port status is changed.
 
@@ -340,7 +348,9 @@ class RestRouterAPI(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def _flow_stats_reply_handler(self, ev):
-        RouterController.reply_stats_message(ev.msg,REPLY_FLOW_STATS)
+        # RouterController.reply_stats_message(ev.msg,REPLY_FLOW_STATS)
+
+	self._stats_reply_handler(ev)
 
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def _port_stats_reply_handler(self, ev):
@@ -384,10 +394,13 @@ class RouterController(ControllerBase):
     _ROUTER_LIST = {}
     _LOGGER = None
     _LINK_STATE = {}
+    _FLOW_WAITER = None
 
     def __init__(self, req, link, data, **config):
         super(RouterController, self).__init__(req, link, data, **config)
         self.waiters = data['waiters']
+	# print self.waiters
+	# print type(self.waiters)
 
     @classmethod
     def set_logger(cls, logger):
@@ -405,7 +418,7 @@ class RouterController(ControllerBase):
     def register_router(cls, dp):
         dpid = {'sw_id': dpid_lib.dpid_to_str(dp.id)}
         try:
-            router = Router(dp, cls._LOGGER)
+            router = Router(dp, cls._LOGGER, cls._FLOW_WAITER)
         except OFPUnknownVersion as message:
             cls._LOGGER.error(str(message), extra=dpid)
             return
@@ -446,12 +459,37 @@ class RouterController(ControllerBase):
 
     @classmethod
     def _flow_stats_reply(cls, msg):
-	dpid = {'sw_id': dpid_lib.dpid_to_str(msg.datapath.id)}
-        for stat in sorted([flow for flow in msg.body if flow.match['ipv4_dst']],
-                           key=lambda flow: (flow.match['ipv4_dst'])):
-                cls._LOGGER.info('%17s %8d %8d',
-                             stat.match['ipv4_dst'],
-                             stat.packet_count, stat.byte_count, extra=dpid)
+	dp = msg.datapath
+	dp_id = dp.id
+	dpid = {'sw_id': dpid_lib.dpid_to_str(dp_id)}
+
+	cls._LOGGER.info('waiters: {}'.format(id(cls._FLOW_WAITER)), extra=dpid)
+	'''
+        router = cls._ROUTER_LIST[dp_id]
+        router._get_flow_state(msg)
+	'''
+	#print cls._FLOW_WAITER
+
+        if (dp_id not in cls._FLOW_WAITER
+                or msg.xid not in cls._FLOW_WAITER[dp_id]):
+            cls._LOGGER.info("none waiters data...",extra=dpid)
+            return
+        event, msgs = cls._FLOW_WAITER[dp_id][msg.xid]
+	cls._LOGGER.info('msgs(reply): {}'.format(id(msgs)),extra=dpid)
+        msgs.append(msg)
+	# print 'data: {}'.format(cls._FLOW_WAITER[dp_id][msg.xid])
+
+        if ofproto_v1_3.OFP_VERSION == dp.ofproto.OFP_VERSION:
+            more = dp.ofproto.OFPMPF_REPLY_MORE
+        else:
+            more = dp.ofproto.OFPSF_REPLY_MORE
+        if msg.flags & more:
+            return
+        del cls._FLOW_WAITER[dp_id][msg.xid]
+	print 'del data'
+        event.set()
+	# print msgs
+
 
     @classmethod
     def _port_stats_reply(cls, msg):
@@ -479,8 +517,8 @@ class RouterController(ControllerBase):
 	    cls._LINK_STATE[(msg.datapath.id, stat.port_no)].setdefault('bandwidth',
 				(float(now_rx_bytes)/(float(link_speed)*1000.0))*100.0)
 	    cls._LINK_STATE[(msg.datapath.id, stat.port_no)]['bandwidth'] = (float(now_rx_bytes)/(float(link_speed)*1000.0))*100.0
-            cls._LOGGER.info(datetime.datetime.now(), extra=dpid)
-	    cls._LOGGER.info('use of bandwidth: %8f bps',cls._LINK_STATE[(msg.datapath.id, stat.port_no)]['bandwidth'],extra=dpid)
+            # cls._LOGGER.info(datetime.datetime.now(), extra=dpid)
+	    # cls._LOGGER.info('use of bandwidth: %8f bps',cls._LINK_STATE[(msg.datapath.id, stat.port_no)]['bandwidth'],extra=dpid)
 
     @classmethod
     def _port_desc_reply(cls, msg):
@@ -491,7 +529,7 @@ class RouterController(ControllerBase):
 	    cls._LINK_STATE.setdefault((msg.datapath.id, p.port_no),{})
 	    cls._LINK_STATE[(msg.datapath.id, p.port_no)].setdefault('speed',p.curr_speed)
 	    cls._LINK_STATE[(msg.datapath.id, p.port_no)]['speed'] = p.curr_speed
-            cls._LOGGER.info('%d %s %d %d',p.port_no, p.name, p.curr_speed, p.max_speed, extra=dpid)	
+            # cls._LOGGER.info('%d %s %d %d',p.port_no, p.name, p.curr_speed, p.max_speed, extra=dpid)	
 	
     # GET /router/{switch_id}
     @rest_command
@@ -560,13 +598,15 @@ class RouterController(ControllerBase):
 
 
 class Router(dict):
-    def __init__(self, dp, logger):
+    def __init__(self, dp, logger, waiter):
         super(Router, self).__init__()
         self.dp = dp
         self.dpid_str = dpid_lib.dpid_to_str(dp.id)
         self.sw_id = {'sw_id': self.dpid_str}
         self.logger = logger
 	self.obsr_waiters = {}
+	self.flow_waiters = waiter
+	self.logger.info('waiter: {}, self.flow_waiter: {}'.format(id(waiter),id(self.flow_waiters)),extra=self.sw_id)
 
         # print "show datapath ports"
 	# print dp.ports
@@ -714,7 +754,7 @@ class Router(dict):
 
             # Event dispatch
             if vlan_id in self:
-                self[vlan_id].packet_in_handler(msg, header_list)
+                self[vlan_id].packet_in_handler(msg, header_list, self.flow_waiters)
             else:
                 self.logger.debug('Drop unknown vlan packet. [vlan_id=%d]',
                                   vlan_id, extra=self.sw_id)
@@ -736,8 +776,32 @@ class Router(dict):
     def _monitor(self):
         while True:
             for vlan_router in self.values():
+		# vlan_router.flow_waiters = self.obsr_waiters
                 vlan_router.observe_status(self.obsr_waiters)
-            hub.sleep(3)
+            hub.sleep(2)
+
+    def _get_flow_state(self, msg):
+        dp = msg.datapath
+
+        for stat in [flow for flow in msg.body]:
+		self.logger.info(stat.match, extra=self.sw_id)
+                self.logger.info('%8d %8d',
+                		stat.packet_count, stat.byte_count, extra=self.sw_id)
+        if (dp.id not in self.flow_waiters
+                or msg.xid not in self.flow_waiters[dp.id]):
+            self.logger.info("none waiters data...",extra=self.sw_id)
+	    return
+        event, msgs = self.flow_waiters[dp.id][msg.xid]
+        msgs.append(msg)
+
+        if ofproto_v1_3.OFP_VERSION == dp.ofproto.OFP_VERSION:
+            more = dp.ofproto.OFPMPF_REPLY_MORE
+        else:
+            more = dp.ofproto.OFPSF_REPLY_MORE
+        if msg.flags & more:
+            return
+        del self.flow_waiters[dp.id][msg.xid]
+        event.set()
 
     
 class VlanRouter(object):
@@ -757,6 +821,7 @@ class VlanRouter(object):
         self.ofctl = OfCtl.factory(dp, logger)
 
 	self.mac_flag = {}
+	# self.flow_waiters = {}
 
         # Set flow: default route (drop)
         self._set_defaultroute_drop()
@@ -773,10 +838,9 @@ class VlanRouter(object):
         assert len(self.packet_buffer) == 0
 
     def observe_status(self,waiters):
-	flowstat, portstat, descstat = self.ofctl._request_stats(waiters)
-	print 'flowstat: {}'.format(flowstat)
-	print 'portstat: {}'.format(portstat)
-	print 'descstat: {}'.format(descstat)
+	portstat, descstat = self.ofctl._request_stats(waiters)
+	#print 'portstat: {}'.format(portstat)
+	#print 'descstat: {}'.format(descstat)
 
     @staticmethod
     def _cookie_to_id(id_type, cookie):
@@ -1077,7 +1141,9 @@ class VlanRouter(object):
                 raise ValueError(err_msg % (REST_ROUTEID, e.message))
 
         # Get all flow.
+	self.logger.info('get all flow (delete routing data)', extra=self.sw_id)
         msgs = self.ofctl.get_all_flow(waiters)
+	self.logger.info('done get all flow (delete routing data)', extra=self.sw_id)
 
         delete_list = []
         for msg in msgs:
@@ -1132,7 +1198,7 @@ class VlanRouter(object):
                     break
         return relate_list
 
-    def packet_in_handler(self, msg, header_list):
+    def packet_in_handler(self, msg, header_list, waiters):
         # Check invalid TTL (for OpenFlow V1.2/1.3)
         ofproto = self.dp.ofproto
 	'''
@@ -1146,7 +1212,9 @@ class VlanRouter(object):
         if ARP in header_list:
             self._packetin_arp(msg, header_list)
             return
-
+	if LLDP in header_list:
+	    self._packetin_lldp(msg, header_list)
+	    return
         if IPV4 in header_list:
             rt_ports = self.address_data.get_default_gw()
 	    if header_list[IPV4].dst in rt_ports:
@@ -1161,7 +1229,7 @@ class VlanRouter(object):
                 self._packetin_to_node(msg, header_list)
 	    
 	    if TCP in header_list or UDP in header_list:
-                self._packetin_tcp_udp(msg, header_list)
+                self._packetin_tcp_udp(msg, header_list, waiters)
 	    
 
 	    return
@@ -1264,7 +1332,10 @@ class VlanRouter(object):
         self.logger.info('Send ICMP echo reply to [%s].', srcip,
                          extra=self.sw_id)
 
-    def _packetin_tcp_udp(self, msg, header_list):
+    def _packetin_lldp(self, msg, header_list):
+	self.logger.info(msg, extra=self.sw_id)
+
+    def _packetin_tcp_udp(self, msg, header_list, waiters):
         # Send ICMP port unreach error.
         in_port = self.ofctl.get_packetin_inport(msg)
 	'''
@@ -1282,6 +1353,8 @@ class VlanRouter(object):
 	pkt_eth = pkt.get_protocol(ethernet.ethernet)
 	pkt_tcp = pkt.get_protocol(tcp.tcp)
 	pkt_pay = pkt.protocols[-1]
+
+	self.logger.info('waiters: {}'.format(id(waiters)), extra=self.sw_id)
 
 	l4_type=6
 
@@ -1308,8 +1381,9 @@ class VlanRouter(object):
 	flow_data.pkt_count += 1
 
 	if pkt_pay != pkt_tcp and datapath.id == 3:
-	    flow_data.count += 1
-	    if flow_data.count == 1 and pkt_pay.encode('hex')[:16] == '89504e470d0a1a0a':
+	    if pkt_pay.encode('hex')[:16] == '89504e470d0a1a0a' and not flow_data.flag:
+		flow_data.count += 1
+		flow_data.data_h = pkt_pay.encode('hex')[:16]
 		flow_data.flag = True
 		if datapath.id == 3:
 		    out_port = 2
@@ -1338,21 +1412,43 @@ class VlanRouter(object):
 		    			dl_vlan=self.vlan_id, srcip=srcip, dstip=dstip, 
 		    			sport=srcport, dport=dstport, label=flow_data.label, flag=flow_data.flag)
 		
-		    '''
-		    self.ofctl.set_packetin_flow(cookie, priority,out_port,
-                                     dl_type=ether.ETH_TYPE_IP,
-                                     dl_vlan=self.vlan_id,
-                                     dst_ip=route.dst_ip,
-                                     dst_mask=route.netmask,
-                                     ip_proto=l4_type,
-                                     tcp_dst=route.dst_port,
-                                     tcp_src=route.src_port,
-				     mpls_label=label,
-				     labelflag=True)
-		    '''
 		    self.logger.info('done packet send', extra=self.sw_id)
 		    self.ofctl.send_packet_out(in_port, self.dp.ofproto.OFPP_TABLE, msg.data)
 		    self.send_arp_request(srcip, dstip)
+	    
+	    elif ('0049454e44' in pkt_pay.encode('hex')[-24:] or 
+                    '66696e697368696d616765' in pkt_pay.encode('hex')):
+                check_type = 'this is finish png'
+                self.logger.info('this packet is end of png!',extra=self.sw_id)
+                flow_data.flag = False
+                # フローを削除する
+		del_flow = self.l4data_tbl.get_data(header='89504e470d0a1a0a')
+		
+		self.logger.info('get all flow (delete routing data)', extra=self.sw_id)
+        	msgs = self.ofctl.get_all_flow(waiters)
+        	self.logger.info('done get all flow (delete routing data)', extra=self.sw_id)
+
+                self.logger.info('flow_msgs: {}'.format(bool(msgs)),extra=self.sw_id)
+                for msg in flow_msgs:
+                    for stat in msg.body:
+                        if not stat.match['ipv4_src']:
+                            continue
+                        if not stat.match['ipv4_dst']:
+                            continue
+                        if not stat.match['tcp_src']:
+                            continue
+                        if not stat.match['tcp_dst']:
+                            continue
+                        if not stat.match['metadata']:
+                            self.logger.info('flow data exist, but metadata is none...',extra=self.sw_id)
+                            continue
+                        self.logger.info(stat,extra=self.sw_id)
+                        self.ofctl.delete_flow(stat)
+                        route_id = VlanRouter._cookie_to_id(REST_ROUTEID,
+                                                    stat.cookie)
+                        self.routing_tbl.delete(route_id)
+		self.logger.info("done delete metadata flow",extra=self.sw_id)
+
 	    elif flow_data.flag == True:
 		# パケットにmetadataを付与
 		check_type = 'Image!'
@@ -1362,10 +1458,6 @@ class VlanRouter(object):
                 # m = parser.OFPPacketOut(datapath=datapath,buffer_id=self.dp.ofproto.OFP_NO_BUFFER,in_port=in_port,actions=actions,data=msg.data)
                 # self.dp.send_msg(m)
 		# self.dp.send_packet_out(buffer_id=UINT32_MAX, in_port=in_port, actions=actions, data=msg.data)
-	    elif '0000000049454e44' in pkt_pay.encode('hex'):
-		check_type = 'this is finish png'
-		flow_data.flag = False
-		# フローを削除する
 	    else:
 		check_type = 'not'
 	    
@@ -1375,9 +1467,9 @@ class VlanRouter(object):
             # print >> f, pkt_pay.encode('hex')
             # f.close()
 	else:
-            print 'pkt_pay is none'
 	    if flow_data.pkt_count == 1:
 	        self.send_arp_request(srcip, dstip)
+            print 'pkt_pay is none'
 	#self.logger.info(pprint.pformat(), extra=self.sw_id)
 	# pkt_pay = pkt.protocols[-1]
 	# print pkt_pay
@@ -2032,6 +2124,24 @@ class OfCtl(object):
             data_str = str(packet.Packet(data))
         self.logger.debug('Packet out = %s', data_str, extra=self.sw_id)
 
+    def send_lldp_packet(self, port_no, dl_addr):
+        datapath = self.dp
+        if datapath is None:
+            #datapath was already deleted
+            return
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        lldp_data = LLDPPacket.lldp_packet(datapath.id,
+                        port_no,
+                        dl_addr,
+                        120)
+        output_port = parser.OFPActionOutput(port_no,
+                                            ofproto.OFPCML_NO_BUFFER)
+        packet_out = parser.OFPPacketOut(datapath, ofproto.OFPP_ANY,
+                                          ofproto.OFPP_CONTROLLER,
+                                          [output_port], lldp_data)
+        datapath.send_msg(packet_out)
+
     def set_normal_flow(self, cookie, priority):
         out_port = self.dp.ofproto.OFPP_NORMAL
         # actions = [self.dp.ofproto_parser.OFPActionOutput(out_port, 0)]
@@ -2057,18 +2167,22 @@ class OfCtl(object):
 
     def send_stats_request(self, stats, waiters):
         self.dp.set_xid(stats)
+	self.logger.info('waiters: {}'.format(id(waiters)),extra=self.sw_id)
         waiters_per_dp = waiters.setdefault(self.dp.id, {})
         event = hub.Event()
         msgs = []
+	self.logger.info('msgs: {}'.format(id(msgs)),extra=self.sw_id)
         waiters_per_dp[stats.xid] = (event, msgs)
         self.dp.send_msg(stats)
 
         try:
             event.wait(timeout=OFP_REPLY_TIMER)
         except hub.Timeout:
+	    self.logger.info('timeout...',extra=self.sw_id)
             del waiters_per_dp[stats.xid]
 
-        return msgs
+        self.logger.info('return send_stats_request: {}'.format(msgs), extra=self.sw_id)
+	return msgs
 
 
 @OfCtl.register_of_version(ofproto_v1_0.OFP_VERSION)
@@ -2327,7 +2441,7 @@ class OfCtl_after_v1_2(OfCtl):
         actions = []
         if flag:
             actions.append(ofp_parser.OFPActionSetField(metadata=int(label)))
-            actions.append(ofp_parser.OFPActionOutput(self.dp.ofproto.OFPP_IN_PORT, 0))
+            actions.append(ofp_parser.OFPActionOutput(self.dp.ofproto.OFPP_CONTROLLER, miss_send_len))
 
 	self.logger.info('actions length: {}'.format(str(len(actions))),extra=self.sw_id)
 	self.logger.info('buffer id: {}'.format(str(buffer_id)),extra=self.sw_id)
@@ -2454,17 +2568,15 @@ class OfCtl_v1_3(OfCtl_after_v1_2):
         ofp_parser = self.dp.ofproto_parser
 	match = ofp_parser.OFPMatch()
 
-        req = ofp_parser.OFPFlowStatsRequest(self.dp, 0, ofp.OFPTT_ALL, ofp.OFPP_ANY,
-						ofp.OFPG_ANY, 0, 0, match)
-	rep_flow = self.send_stats_request(req,waiters)
-
         req = ofp_parser.OFPPortStatsRequest(self.dp, 0, ofp.OFPP_ANY)
+	# self.dp.send_msg(req)
 	rep_port = self.send_stats_request(req,waiters)
 
 	req = ofp_parser.OFPPortDescStatsRequest(self.dp, 0)
+	# self.dp.send_msg(stats)
 	rep_podesc = self.send_stats_request(req,waiters)
 
-	return rep_flow,rep_port,rep_podesc
+	return rep_port,rep_podesc
 
 def ip_addr_aton(ip_str, err_msg=None):
     try:
