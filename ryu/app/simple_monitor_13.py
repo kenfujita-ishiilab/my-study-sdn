@@ -59,9 +59,13 @@ class SimpleMonitor13(simple_switch_13.SimpleSwitch13):
         req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
         datapath.send_msg(req)
 
+	req = parser.OFPPortDescStatsRequest(datapath, 0)
+        datapath.send_msg(req)
+
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def _flow_stats_reply_handler(self, ev):
         body = ev.msg.body
+	print body
 
         self.logger.info('datapath         '
                          'in-port  eth-dst           '
@@ -81,6 +85,7 @@ class SimpleMonitor13(simple_switch_13.SimpleSwitch13):
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
     def _port_stats_reply_handler(self, ev):
         body = ev.msg.body
+	print body
 
         self.logger.info('datapath         port     '
                          'rx-pkts  rx-bytes rx-error '
@@ -93,3 +98,20 @@ class SimpleMonitor13(simple_switch_13.SimpleSwitch13):
                              ev.msg.datapath.id, stat.port_no,
                              stat.rx_packets, stat.rx_bytes, stat.rx_errors,
                              stat.tx_packets, stat.tx_bytes, stat.tx_errors)
+
+    @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
+    def port_desc_stats_reply_handler(self, ev):
+        ports = []
+        for p in ev.msg.body:
+            ports.append('port_no=%d hw_addr=%s name=%s config=0x%08x '
+                         'state=0x%08x curr=0x%08x advertised=0x%08x '
+                         'supported=0x%08x peer=0x%08x curr_speed=%d '
+                         'max_speed=%d' %
+                         (p.port_no, p.hw_addr,
+                          p.name, p.config,
+                          p.state, p.curr, p.advertised,
+                          p.supported, p.peer, p.curr_speed,
+                          p.max_speed))
+        self.logger.info('%016x OFPPortDescStatsReply received: %s', ev.msg.datapath.id, ports)
+
+
